@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -24,7 +25,7 @@ import (
 const chunkSize = 4 * 1024 * 1024
 
 // upload implements the two-pass upload flow for Baidu Netdisk
-// Pass 1: Read entire file to calculate chunk MD5 hashes
+// Pass 1: Calculate chunk MD5 hashes (from source or temp file)
 // Pass 2: Upload chunks after precreate
 func (o *Object) upload(ctx context.Context, in io.Reader, size int64, options ...fs.OpenOption) error {
 	absPath := o.fs.absPath(o.remote)
@@ -40,33 +41,68 @@ func (o *Object) upload(ctx context.Context, in io.Reader, size int64, options .
 		return o.uploadEmpty(ctx, absPath)
 	}
 
-	// Read entire file into memory (required for two-pass upload and seeking)
-	// This is necessary because:
-	// 1. We need to calculate MD5 hashes for all chunks first (precreate)
-	// 2. Then upload the chunks
-	// 3. rclone may pass an async reader that doesn't support seeking
-	data, err := io.ReadAll(in)
-	if err != nil {
-		return fmt.Errorf("failed to read file data: %w", err)
-	}
-	if int64(len(data)) != size {
-		return fmt.Errorf("size mismatch: expected %d, got %d", size, len(data))
+	// Check if input supports seeking (e.g., local file)
+	// If so, we can read directly without temp file (more efficient)
+	var reader io.ReadSeeker
+	var tmpFile *os.File
+	useDirectAccess := false
+
+	if seeker, ok := in.(io.ReadSeeker); ok {
+		// Test if seeking actually works (asyncreader.AsyncReader implements
+		// io.Seeker but returns error when called)
+		if _, err := seeker.Seek(0, io.SeekCurrent); err == nil {
+			// Input is truly seekable - use it directly
+			reader = seeker
+			useDirectAccess = true
+			fs.Debugf(o, "Using direct file access (seekable input)")
+		}
 	}
 
-	// Use bytes.Reader which supports seeking
-	reader := bytes.NewReader(data)
+	if !useDirectAccess {
+		// Input is not seekable (async reader, stream, etc.)
+		// Spool to temp file
+		var err error
+		tmpFile, err = os.CreateTemp("", "rclone-baidu-upload-*")
+		if err != nil {
+			return fmt.Errorf("failed to create temp file: %w", err)
+		}
+		defer func() {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpFile.Name())
+		}()
 
-	// Pass 1: Calculate MD5 hashes for all chunks
+		// Copy input to temp file while calculating hashes
+		blockList, err := o.spoolAndCalculateHashes(in, tmpFile, size)
+		if err != nil {
+			return fmt.Errorf("failed to spool file: %w", err)
+		}
+
+		// Reset temp file for reading
+		if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("failed to seek temp file: %w", err)
+		}
+		reader = tmpFile
+
+		// Skip hash calculation below - we already have blockList
+		return o.uploadWithHashes(ctx, reader, absPath, size, blockList)
+	}
+
+	// For seekable input: calculate hashes first, then upload
 	blockList, err := o.calculateBlockHashes(reader, size)
 	if err != nil {
 		return fmt.Errorf("failed to calculate block hashes: %w", err)
 	}
 
-	// Reset reader to beginning for upload
+	// Reset to beginning for upload
 	if _, err := reader.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("failed to seek to start: %w", err)
 	}
 
+	return o.uploadWithHashes(ctx, reader, absPath, size, blockList)
+}
+
+// uploadWithHashes performs the upload with pre-calculated hashes
+func (o *Object) uploadWithHashes(ctx context.Context, reader io.ReadSeeker, absPath string, size int64, blockList []string) error {
 	// Precreate - check for rapid upload (秒传)
 	precreateResp, err := o.precreate(ctx, absPath, size, blockList)
 	if err != nil {
@@ -112,6 +148,7 @@ func (o *Object) upload(ctx context.Context, in io.Reader, size int64, options .
 }
 
 // calculateBlockHashes reads the entire file and calculates MD5 for each 4MB chunk
+// Used when input is seekable (e.g., local file) - file is read twice but no temp file needed
 func (o *Object) calculateBlockHashes(in io.Reader, size int64) ([]string, error) {
 	numBlocks := (size + chunkSize - 1) / chunkSize
 	blockList := make([]string, 0, numBlocks)
@@ -132,6 +169,51 @@ func (o *Object) calculateBlockHashes(in io.Reader, size int64) ([]string, error
 		if err == io.ErrUnexpectedEOF {
 			break
 		}
+	}
+
+	return blockList, nil
+}
+
+// spoolAndCalculateHashes reads from input, writes to temp file, and calculates MD5 hashes
+// for each 4MB chunk in a single pass (memory-efficient for non-seekable inputs)
+func (o *Object) spoolAndCalculateHashes(in io.Reader, out io.Writer, size int64) ([]string, error) {
+	numBlocks := (size + chunkSize - 1) / chunkSize
+	blockList := make([]string, 0, numBlocks)
+
+	buf := make([]byte, chunkSize)
+	totalRead := int64(0)
+
+	for totalRead < size {
+		// Calculate how much to read for this chunk
+		remaining := size - totalRead
+		toRead := int64(chunkSize)
+		if remaining < toRead {
+			toRead = remaining
+		}
+
+		// Read chunk
+		n, err := io.ReadFull(in, buf[:toRead])
+		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+			return nil, fmt.Errorf("read error at offset %d: %w", totalRead, err)
+		}
+		if n == 0 {
+			break
+		}
+
+		// Write to temp file
+		if _, err := out.Write(buf[:n]); err != nil {
+			return nil, fmt.Errorf("write error at offset %d: %w", totalRead, err)
+		}
+
+		// Calculate MD5 hash for this chunk
+		hash := md5.Sum(buf[:n])
+		blockList = append(blockList, hex.EncodeToString(hash[:]))
+
+		totalRead += int64(n)
+	}
+
+	if totalRead != size {
+		return nil, fmt.Errorf("size mismatch: expected %d bytes, got %d", size, totalRead)
 	}
 
 	return blockList, nil
