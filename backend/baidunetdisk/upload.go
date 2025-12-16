@@ -26,7 +26,7 @@ const chunkSize = 4 * 1024 * 1024
 // upload implements the two-pass upload flow for Baidu Netdisk
 // Pass 1: Read entire file to calculate chunk MD5 hashes
 // Pass 2: Upload chunks after precreate
-func (o *Object) upload(ctx context.Context, in io.ReadSeeker, size int64, options ...fs.OpenOption) error {
+func (o *Object) upload(ctx context.Context, in io.Reader, size int64, options ...fs.OpenOption) error {
 	absPath := o.fs.absPath(o.remote)
 
 	// Ensure parent directory exists
@@ -40,14 +40,30 @@ func (o *Object) upload(ctx context.Context, in io.ReadSeeker, size int64, optio
 		return o.uploadEmpty(ctx, absPath)
 	}
 
+	// Read entire file into memory (required for two-pass upload and seeking)
+	// This is necessary because:
+	// 1. We need to calculate MD5 hashes for all chunks first (precreate)
+	// 2. Then upload the chunks
+	// 3. rclone may pass an async reader that doesn't support seeking
+	data, err := io.ReadAll(in)
+	if err != nil {
+		return fmt.Errorf("failed to read file data: %w", err)
+	}
+	if int64(len(data)) != size {
+		return fmt.Errorf("size mismatch: expected %d, got %d", size, len(data))
+	}
+
+	// Use bytes.Reader which supports seeking
+	reader := bytes.NewReader(data)
+
 	// Pass 1: Calculate MD5 hashes for all chunks
-	blockList, err := o.calculateBlockHashes(in, size)
+	blockList, err := o.calculateBlockHashes(reader, size)
 	if err != nil {
 		return fmt.Errorf("failed to calculate block hashes: %w", err)
 	}
 
 	// Reset reader to beginning for upload
-	if _, err := in.Seek(0, io.SeekStart); err != nil {
+	if _, err := reader.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("failed to seek to start: %w", err)
 	}
 
@@ -81,7 +97,7 @@ func (o *Object) upload(ctx context.Context, in io.ReadSeeker, size int64, optio
 
 	// Upload each required block
 	for _, blockIdx := range blocksToUpload {
-		if err := o.uploadBlock(ctx, in, absPath, uploadID, blockIdx, size); err != nil {
+		if err := o.uploadBlock(ctx, reader, absPath, uploadID, blockIdx, size); err != nil {
 			return fmt.Errorf("failed to upload block %d: %w", blockIdx, err)
 		}
 	}

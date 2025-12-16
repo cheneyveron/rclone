@@ -292,22 +292,29 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		CanHaveEmptyDirectories: true,
 		ReadMimeType:            false,
 		WriteMimeType:           false,
+		NoMultiThreading:        true, // Baidu requires seekable input for two-pass upload
 	}).Fill(ctx, f)
 
 	// Create REST client
 	f.srv = rest.NewClient(f.client).SetRoot(rootURL).SetErrorHandler(errorHandler)
 
 	// Check if root exists and is a file
-	absRoot := f.absPath("")
 	if f.root != "" {
+		absRoot := f.absPath("")
 		info, err := f.getFileInfo(ctx, absRoot)
 		if err == nil {
 			if info.IsDir == 0 {
-				// Root is a file
-				f.root = path.Dir(f.root)
+				// Root is a file - set root to parent directory
+				newRoot := path.Dir(f.root)
+				if newRoot == "." {
+					newRoot = ""
+				}
+				f.root = newRoot
 				return f, fs.ErrorIsFile
 			}
 		}
+		// If error is ErrorObjectNotFound, the path doesn't exist as a file
+		// Check if it could be a directory that doesn't exist yet (which is fine)
 	}
 
 	return f, nil
@@ -495,12 +502,6 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 // Put uploads a file
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	// Check if the input is seekable
-	seeker, ok := in.(io.ReadSeeker)
-	if !ok {
-		return nil, errors.New("baidu backend requires a seekable input (local file); streaming upload is not supported. Please use --vfs-cache-mode writes if mounting")
-	}
-
 	remote := src.Remote()
 	size := src.Size()
 
@@ -509,7 +510,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		remote: remote,
 	}
 
-	err := o.upload(ctx, seeker, size, options...)
+	err := o.upload(ctx, in, size, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -856,7 +857,19 @@ func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
 	if ty != hash.MD5 {
 		return "", hash.ErrUnsupported
 	}
-	return strings.ToLower(o.md5), nil
+	// Baidu returns invalid MD5 hashes for small files (containing non-hex characters)
+	// Only return MD5 if it looks valid (32 hex characters)
+	md5 := strings.ToLower(o.md5)
+	if len(md5) != 32 {
+		return "", nil
+	}
+	for _, c := range md5 {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			// Invalid hex character, return empty (unknown hash)
+			return "", nil
+		}
+	}
+	return md5, nil
 }
 
 // Open opens the object for reading
@@ -915,13 +928,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 // Update updates the object with new content
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	// Check if the input is seekable
-	seeker, ok := in.(io.ReadSeeker)
-	if !ok {
-		return errors.New("baidu backend requires a seekable input (local file); streaming upload is not supported. Please use --vfs-cache-mode writes if mounting")
-	}
-
-	return o.upload(ctx, seeker, src.Size(), options...)
+	return o.upload(ctx, in, src.Size(), options...)
 }
 
 // Remove removes the object
