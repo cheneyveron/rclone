@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,8 +42,39 @@ func TestMain(m *testing.M) {
 	fstest.TestMain(m)
 }
 
+// sharingRefused caches whether the remote refuses sharing invitations.
+var sharingRefused *bool
+
+// skipIfSharingRefused skips t if the remote cannot add permissions via
+// the driveItem invite API.
+//
+// Microsoft has been progressively disabling sharing invitations on
+// both Business and Personal accounts (the invite API returns 400
+// sharingFailed for any recipient on affected accounts), which makes
+// the permission writing tests impossible.
+func (f *Fs) skipIfSharingRefused(t *testing.T, r *fstest.Run) {
+	if sharingRefused == nil {
+		file := r.WriteObject(ctx, randomFilename(), "sharing probe", t2)
+		obj, err := r.Fremote.NewObject(ctx, file.Path)
+		require.NoError(t, err)
+		m := f.newMetadata(obj.Remote())
+		m.normalizedID = obj.(*Object).id
+		p := defaultPermissions(f.driveType)[0]
+		p.Roles[0] = api.ReadRole
+		_, _, err = m.addPermission(ctx, p)
+		_ = obj.Remove(ctx)
+		refused := err != nil && strings.Contains(err.Error(), "sharingFailed")
+		sharingRefused = &refused
+	}
+	if *sharingRefused {
+		t.Skip("skipping test: server refuses sharing invitations (sharingFailed)")
+	}
+}
+
 // TestWritePermissions tests reading and writing permissions
 func (f *Fs) TestWritePermissions(t *testing.T, r *fstest.Run) {
+	f.skipIfSharingRefused(t, r)
+
 	// setup
 	ctx, ci := fs.AddConfig(ctx)
 	ci.Metadata = true
@@ -136,16 +168,13 @@ func (f *Fs) TestReadPermissions(t *testing.T, r *fstest.Run) {
 	_, expectedMeta := f.putWithMeta(ctx, t, &file1, []*api.PermissionsType{}) // return var intentionally switched here
 	permissions := defaultPermissions(f.driveType)
 	_, actualMeta := f.putWithMeta(ctx, t, &file1, permissions)
-	if f.driveType == driveTypePersonal {
-		perms, ok := actualMeta["permissions"]
-		assert.False(t, ok, fmt.Sprintf("permissions metadata key was unexpectedly found: %v", perms))
-		return
-	}
 	assert.JSONEq(t, expectedMeta["permissions"], actualMeta["permissions"])
 }
 
 // TestReadMetadata tests that all the read-only system properties are present and non-blank
 func (f *Fs) TestReadMetadata(t *testing.T, r *fstest.Run) {
+	f.skipIfSharingRefused(t, r)
+
 	// setup
 	ctx, ci := fs.AddConfig(ctx)
 	ci.Metadata = true
@@ -159,7 +188,7 @@ func (f *Fs) TestReadMetadata(t *testing.T, r *fstest.Run) {
 		if slices.Contains(optionals, k) {
 			continue
 		}
-		if k == "description" && f.driveType != driveTypePersonal {
+		if k == "description" {
 			continue // not supported
 		}
 		gotV, ok := actualMeta[k]
@@ -170,6 +199,8 @@ func (f *Fs) TestReadMetadata(t *testing.T, r *fstest.Run) {
 
 // TestDirectoryMetadata tests reading and writing modtime and other metadata and permissions for directories
 func (f *Fs) TestDirectoryMetadata(t *testing.T, r *fstest.Run) {
+	f.skipIfSharingRefused(t, r)
+
 	// setup
 	ctx, ci := fs.AddConfig(ctx)
 	ci.Metadata = true
@@ -196,7 +227,7 @@ func (f *Fs) TestDirectoryMetadata(t *testing.T, r *fstest.Run) {
 			if slices.Contains(optionals, k) {
 				continue
 			}
-			if k == "description" && f.driveType != driveTypePersonal {
+			if k == "description" {
 				continue // not supported
 			}
 			gotV, ok := actualMeta[k]
@@ -281,6 +312,8 @@ func (f *Fs) TestDirectoryMetadata(t *testing.T, r *fstest.Run) {
 
 // TestServerSideCopyMove tests server-side Copy and Move
 func (f *Fs) TestServerSideCopyMove(t *testing.T, r *fstest.Run) {
+	f.skipIfSharingRefused(t, r)
+
 	// setup
 	ctx, ci := fs.AddConfig(ctx)
 	ci.Metadata = true
@@ -325,6 +358,8 @@ func (f *Fs) TestServerSideCopyMove(t *testing.T, r *fstest.Run) {
 
 // TestMetadataMapper tests adding permissions with the --metadata-mapper
 func (f *Fs) TestMetadataMapper(t *testing.T, r *fstest.Run) {
+	f.skipIfSharingRefused(t, r)
+
 	// setup
 	ctx, ci := fs.AddConfig(ctx)
 	ci.Metadata = true
@@ -417,9 +452,7 @@ func (f *Fs) compareMeta(t *testing.T, expectedMeta, actualMeta fs.Metadata, ign
 			compareTimeStrings(t, k, v, gotV, time.Second)
 			continue
 		case "description":
-			if f.driveType != driveTypePersonal {
-				continue // not supported
-			}
+			continue // not supported
 		}
 		assert.True(t, ok, fmt.Sprintf("expected metadata key is missing: %v", k))
 		assert.Equal(t, v, gotV, actualMeta)

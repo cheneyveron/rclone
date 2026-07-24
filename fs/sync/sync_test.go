@@ -806,7 +806,7 @@ func TestSyncBasedOnCheckSum(t *testing.T) {
 
 // Create a file and sync it. Change the last modified date and the
 // file contents but not the size.  If we're only doing sync by size
-// only, we expect nothing to to be transferred on the second sync.
+// only, we expect nothing to be transferred on the second sync.
 func TestSyncSizeOnly(t *testing.T) {
 	ctx := context.Background()
 	ctx, ci := fs.AddConfig(ctx)
@@ -843,7 +843,7 @@ func TestSyncSizeOnly(t *testing.T) {
 }
 
 // Create a file and sync it. Keep the last modified date but change
-// the size.  With --ignore-size we expect nothing to to be
+// the size.  With --ignore-size we expect nothing to be
 // transferred on the second sync.
 func TestSyncIgnoreSize(t *testing.T) {
 	ctx := context.Background()
@@ -3101,7 +3101,36 @@ func testLoggerVsLsf(ctx context.Context, fdst, fsrc fs.Fs, logger *bytes.Buffer
 
 	if fsrc.Precision() == fdst.Precision() && fsrc.Hashes().Contains(hash.MD5) && canTestHash {
 		lsf := DstLsf(ctx, fdst)
+		blankMissingHashes(&newlogger, lsf)
 		err := LoggerMatchesLsf(&newlogger, lsf)
 		require.NoError(t, err)
 	}
+}
+
+// blankMissingHashes clears the hash in logger lines for paths where
+// the lsf listing has an empty hash. An empty hash from a backend
+// means the hash is unknown, not wrong - for example ownCloud does
+// not carry the checksum over on a server-side copy - so it should
+// not be compared against the hash the logger predicted.
+func blankMissingHashes(logger, lsf *bytes.Buffer) {
+	noHash := map[string]bool{}
+	for _, line := range bytes.Split(lsf.Bytes(), []byte("\n")) {
+		elements := bytes.SplitN(line, []byte(";"), 4)
+		if len(elements) == 4 && len(elements[1]) == 0 {
+			noHash[string(elements[3])] = true
+		}
+	}
+	if len(noHash) == 0 {
+		return
+	}
+	loggerSplit := bytes.Split(logger.Bytes(), []byte("\n"))
+	for i, line := range loggerSplit {
+		elements := bytes.SplitN(line, []byte(";"), 4)
+		if len(elements) == 4 && noHash[string(elements[3])] {
+			elements[1] = nil
+			loggerSplit[i] = bytes.Join(elements, []byte(";"))
+		}
+	}
+	logger.Reset()
+	logger.Write(bytes.Join(loggerSplit, []byte("\n")))
 }

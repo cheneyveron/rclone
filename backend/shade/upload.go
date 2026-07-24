@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"path"
@@ -16,6 +17,7 @@ import (
 	"github.com/rclone/rclone/backend/shade/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/chunksize"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/lib/multipart"
 	"github.com/rclone/rclone/lib/rest"
 )
@@ -124,10 +126,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 
 	err = o.fs.pacer.Call(func() (bool, error) {
 		res, err := o.fs.srv.CallJSON(ctx, &opts, reqBody, &initResp)
-		if err != nil {
-			return res != nil && res.StatusCode == http.StatusTooManyRequests, err
-		}
-		return false, nil
+		return shouldRetry(ctx, res, err)
 	})
 
 	if err != nil {
@@ -182,10 +181,7 @@ func (s *shadeChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, read
 
 	err = s.f.pacer.Call(func() (bool, error) {
 		res, err := s.f.srv.CallJSON(ctx, &partOpts, nil, &partURL)
-		if err != nil {
-			return res != nil && res.StatusCode == http.StatusTooManyRequests, err
-		}
-		return false, nil
+		return shouldRetry(ctx, res, err)
 	})
 
 	if err != nil {
@@ -194,7 +190,6 @@ func (s *shadeChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, read
 	opts := rest.Opts{
 		Method:        "PUT",
 		RootURL:       partURL.URL,
-		Body:          &chunk,
 		ContentType:   "",
 		ContentLength: &n,
 	}
@@ -203,17 +198,14 @@ func (s *shadeChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, read
 	var uploadRes *http.Response
 	if len(partURL.Headers) > 0 {
 		opts.ExtraHeaders = make(map[string]string)
-		for k, v := range partURL.Headers {
-			opts.ExtraHeaders[k] = v
-		}
+		maps.Copy(opts.ExtraHeaders, partURL.Headers)
 	}
 
 	err = s.f.pacer.Call(func() (bool, error) {
+		// Use a fresh reader for each attempt so retries resend the whole chunk
+		opts.Body = bytes.NewReader(chunk.Bytes())
 		uploadRes, err = s.f.srv.Call(ctx, &opts)
-		if err != nil {
-			return uploadRes != nil && uploadRes.StatusCode == http.StatusTooManyRequests, err
-		}
-		return false, nil
+		return shouldRetry(ctx, uploadRes, err)
 	})
 
 	if err != nil {
@@ -277,17 +269,13 @@ func (s *shadeChunkWriter) Close(ctx context.Context) error {
 	err = s.f.pacer.Call(func() (bool, error) {
 		res, err := s.f.srv.CallJSON(ctx, &completeOpts, completeBody, &response)
 
-		if err != nil && res == nil {
-			return false, err
-		}
-
-		if res.StatusCode == http.StatusTooManyRequests {
-			return true, err // Retry on 429
+		if err != nil {
+			return shouldRetry(ctx, res, err)
 		}
 
 		if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
 			body, _ := io.ReadAll(res.Body)
-			return false, fmt.Errorf("complete multipart failed with status %d: %s", res.StatusCode, string(body))
+			return fserrors.ShouldRetryHTTP(res, retryErrorCodes), fmt.Errorf("complete multipart failed with status %d: %s", res.StatusCode, string(body))
 		}
 
 		return false, nil

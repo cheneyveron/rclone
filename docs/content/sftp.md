@@ -4,7 +4,7 @@ description: "SFTP"
 versionIntroduced: "v1.36"
 ---
 
-# {{< icon "fa fa-server" >}} SFTP
+# SFTP
 
 SFTP is the [Secure (or SSH) File Transfer
 Protocol](https://en.wikipedia.org/wiki/SSH_File_Transfer_Protocol).
@@ -1185,6 +1185,12 @@ Properties:
 URL for HTTP CONNECT proxy
 
 Set this to a URL for an HTTP proxy which supports the HTTP CONNECT verb.
+
+Supports the format http://user:pass@host:port, http://host:port, http://host.
+
+Example:
+
+    http://myUser:myPass@proxyhostname.example.com:8000
 
 
 Properties:

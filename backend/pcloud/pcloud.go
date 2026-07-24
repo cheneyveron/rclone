@@ -171,6 +171,7 @@ type Fs struct {
 	dirCache     *dircache.DirCache     // Map of directory path to directory id
 	pacer        *fs.Pacer              // pacer for API calls
 	tokenRenewer *oauthutil.Renew       // renew the token on expiry
+	lastDiffID   int64                  // change tracking state for diff long-polling
 }
 
 // Object describes a pcloud object
@@ -237,6 +238,10 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 
 	// Check if it is an api.Error
 	if apiErr, ok := err.(*api.Error); ok {
+		// Handle error 1101 specifically - don't retry as it's a permanent API restriction
+		if apiErr.Result == 1101 {
+			return false, err
+		}
 		// See https://docs.pcloud.com/errors/ for error treatment
 		// Errors are classified as 1xxx, 2xxx, etc.
 		switch apiErr.Result / 1000 {
@@ -530,10 +535,63 @@ func fileIDtoNumber(fileID string) string {
 // Should return true to finish processing
 type listAllFn func(*api.Item) bool
 
+// listAllRootRecursive handles recursive listing for root directory (folderid=0)
+// using a two-step approach to work around pCloud API limitation
+func (f *Fs) listAllRootRecursive(ctx context.Context, dirID string, directoriesOnly bool, filesOnly bool, fn listAllFn) (found bool, err error) {
+	// List root directory non-recursively to get immediate contents
+	var rootSubdirs []*api.Item
+	found, err = f.listAll(ctx, dirID, false, false, false, func(item *api.Item) bool {
+		if item.IsFolder {
+			// Store subdirectories for recursive list later
+			rootSubdirs = append(rootSubdirs, item)
+			// Handle directories immediately if not filesOnly
+			if !filesOnly {
+				if fn(item) {
+					return true // stop iteration
+				}
+			}
+		} else if !directoriesOnly {
+			// Handle files immediately if not directoriesOnly
+			if fn(item) {
+				return true // stop iteration
+			}
+		}
+		return false // continue iteration
+	})
+	if err != nil || found {
+		return found, err
+	}
+
+	// Recursively list each subdirectory
+	for _, subdir := range rootSubdirs {
+		subdirName := f.opt.Enc.ToStandardName(subdir.Name)
+		found, err = f.listAll(ctx, subdir.ID, directoriesOnly, filesOnly, true, func(item *api.Item) bool {
+			// Prepend the subdirectory name to create correct relative path
+			origItemName := item.Name
+			item.Name = subdirName + "/" + item.Name
+			result := fn(item)
+			item.Name = origItemName
+			return result
+		})
+		if err != nil || found {
+			return found, err
+		}
+	}
+
+	return found, nil
+}
+
 // Lists the directory required calling the user function on each item found
 //
 // If the user fn ever returns true then it early exits with found = true
 func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, filesOnly bool, recursive bool, fn listAllFn) (found bool, err error) {
+	// Special case: root directory with recursive listing
+	// pCloud API rejects folderid=0 with recursive=1 (error 1101)
+	// See: https://github.com/rclone/rclone/issues/9315
+	if recursive && dirIDtoNumber(dirID) == "0" {
+		return f.listAllRootRecursive(ctx, dirID, directoriesOnly, filesOnly, fn)
+	}
+
 	opts := rest.Opts{
 		Method:     "GET",
 		Path:       "/listfolder",
@@ -1033,6 +1091,137 @@ func (f *Fs) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+// ChangeNotify implements fs.Features.ChangeNotify
+func (f *Fs) ChangeNotify(ctx context.Context, notify func(string, fs.EntryType), ch <-chan time.Duration) {
+	// Start long-poll loop in background
+	go f.changeNotifyLoop(ctx, notify, ch)
+}
+
+// changeNotifyLoop contains the blocking long-poll logic.
+func (f *Fs) changeNotifyLoop(ctx context.Context, notify func(string, fs.EntryType), ch <-chan time.Duration) {
+	// Standard polling interval
+	interval := 30 * time.Second
+
+	// Start with diffID = 0 to get the current state
+	var diffID int64
+
+	// Helper to process changes from the diff API
+	handleChanges := func(entries []map[string]any) {
+		notifiedPaths := make(map[string]bool)
+
+		for _, entry := range entries {
+			meta, ok := entry["metadata"].(map[string]any)
+			if !ok {
+				continue
+			}
+
+			// Robust extraction of ParentFolderID
+			var pid int64
+			if val, ok := meta["parentfolderid"]; ok {
+				switch v := val.(type) {
+				case float64:
+					pid = int64(v)
+				case int64:
+					pid = v
+				case int:
+					pid = int64(v)
+				}
+			}
+
+			// Resolve the path using dirCache.GetInv
+			// pCloud uses "d" prefix for directory IDs in cache, but API returns numbers
+			dirID := fmt.Sprintf("d%d", pid)
+			parentPath, ok := f.dirCache.GetInv(dirID)
+
+			if !ok {
+				// Parent not in cache, so we can ignore this change as it is outside
+				// of what the mount has seen or cares about.
+				continue
+			}
+
+			name, _ := meta["name"].(string)
+			fullPath := path.Join(parentPath, name)
+
+			// Determine EntryType (File or Directory)
+			entryType := fs.EntryObject
+			if isFolder, ok := meta["isfolder"].(bool); ok && isFolder {
+				entryType = fs.EntryDirectory
+			}
+
+			// Deduplicate notifications for this batch
+			if !notifiedPaths[fullPath] {
+				fs.Debugf(f, "ChangeNotify: detected change in %q (type: %v)", fullPath, entryType)
+				notify(fullPath, entryType)
+				notifiedPaths[fullPath] = true
+			}
+		}
+	}
+
+	for {
+		// Check context and channel
+		select {
+		case <-ctx.Done():
+			return
+		case newInterval, ok := <-ch:
+			if !ok {
+				return
+			}
+			interval = newInterval
+		default:
+		}
+
+		// Setup /diff Request
+		opts := rest.Opts{
+			Method:     "GET",
+			Path:       "/diff",
+			Parameters: url.Values{},
+		}
+
+		if diffID != 0 {
+			opts.Parameters.Set("diffid", strconv.FormatInt(diffID, 10))
+			opts.Parameters.Set("block", "1")
+		} else {
+			opts.Parameters.Set("last", "0")
+		}
+
+		// Perform Long-Poll
+		// Timeout set to 90s (server usually blocks for 60s max)
+		reqCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		var result api.DiffResult
+
+		_, err := f.srv.CallJSON(reqCtx, &opts, nil, &result)
+		cancel()
+
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			// Ignore timeout errors as they are normal for long-polling
+			if !errors.Is(err, context.DeadlineExceeded) {
+				fs.Infof(f, "ChangeNotify: polling error: %v. Waiting %v.", err, interval)
+				time.Sleep(interval)
+			}
+			continue
+		}
+
+		// If result is not 0, reset DiffID to resync
+		if result.Result != 0 {
+			diffID = 0
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		if result.DiffID != 0 {
+			diffID = result.DiffID
+			f.lastDiffID = diffID
+		}
+
+		if len(result.Entries) > 0 {
+			handleChanges(result.Entries)
+		}
+	}
+}
+
 // Hashes returns the supported hash sets.
 func (f *Fs) Hashes() hash.Set {
 	// EU region supports SHA1 and SHA256 (but rclone doesn't
@@ -1327,7 +1516,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	// opts.Body=0), so upload it as a multipart form POST with
 	// Content-Length set.
 	if size == 0 {
-		formReader, contentType, overhead, err := rest.MultipartUpload(ctx, in, opts.Parameters, "content", leaf)
+		formReader, contentType, overhead, err := rest.MultipartUpload(ctx, in, opts.Parameters, "content", leaf, opts.ContentType)
 		if err != nil {
 			return fmt.Errorf("failed to make multipart upload for 0 length file: %w", err)
 		}
@@ -1401,6 +1590,7 @@ var (
 	_ fs.ListPer         = (*Fs)(nil)
 	_ fs.Abouter         = (*Fs)(nil)
 	_ fs.Shutdowner      = (*Fs)(nil)
+	_ fs.ChangeNotifier  = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
 	_ fs.IDer            = (*Object)(nil)
 )

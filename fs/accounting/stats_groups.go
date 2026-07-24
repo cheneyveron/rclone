@@ -29,9 +29,10 @@ func rcListStats(ctx context.Context, in rc.Params) (rc.Params, error) {
 
 func init() {
 	rc.Add(rc.Call{
-		Path:  "core/group-list",
-		Fn:    rcListStats,
-		Title: "Returns list of stats.",
+		Path:   "core/group-list",
+		NoAuth: true,
+		Fn:     rcListStats,
+		Title:  "Returns list of stats.",
 		Help: `
 This returns list of stats groups currently in memory. 
 
@@ -67,9 +68,10 @@ func rcRemoteStats(ctx context.Context, in rc.Params) (rc.Params, error) {
 
 func init() {
 	rc.Add(rc.Call{
-		Path:  "core/stats",
-		Fn:    rcRemoteStats,
-		Title: "Returns stats about current transfers.",
+		Path:   "core/stats",
+		NoAuth: true,
+		Fn:     rcRemoteStats,
+		Title:  "Returns stats about current transfers.",
 		Help: `
 This returns all available stats:
 
@@ -89,6 +91,7 @@ Returns the following values:
 {
 	"bytes": total transferred bytes since the start of the group,
 	"checks": number of files checked,
+	"deletedDirs": number of directories deleted,
 	"deletes" : number of files deleted,
 	"elapsedTime": time in floating point seconds since rclone was started,
 	"errors": number of errors,
@@ -149,9 +152,10 @@ func rcTransferredStats(ctx context.Context, in rc.Params) (rc.Params, error) {
 
 func init() {
 	rc.Add(rc.Call{
-		Path:  "core/transferred",
-		Fn:    rcTransferredStats,
-		Title: "Returns stats about completed transfers.",
+		Path:   "core/transferred",
+		NoAuth: true,
+		Fn:     rcTransferredStats,
+		Title:  "Returns stats about completed transfers.",
 		Help: `
 This returns stats about completed transfers:
 
@@ -297,9 +301,16 @@ func GlobalStats() *StatsInfo {
 }
 
 // NewStatsGroup creates new stats under named group.
+//
+// The averageLoop is intentionally NOT started here: it is started on
+// demand by NewTransfer / NewTransferRemoteSize when real transfer
+// activity begins and stopped by DoneTransferring when the last
+// transfer completes. Starting it eagerly leaked one goroutine per
+// group that never performed a transfer (issue #9567) - e.g. rcd
+// daemons driven by frequent rc sync/move calls where each call gets
+// a fresh job/N group and the source is often empty.
 func NewStatsGroup(ctx context.Context, group string) *StatsInfo {
 	stats := NewStats(ctx)
-	stats.startAverageLoop()
 	stats.group = group
 	groups.set(ctx, group, stats)
 	return stats
@@ -385,12 +396,14 @@ func (sg *statsGroups) sum(ctx context.Context) *StatsInfo {
 			sum.checkQueueSize += stats.checkQueueSize
 			sum.transfers += stats.transfers
 			sum.transferring.merge(stats.transferring)
+			sum.transferQueue += stats.transferQueue
 			sum.transferQueueSize += stats.transferQueueSize
 			sum.listed += stats.listed
 			sum.renames += stats.renames
 			sum.renameQueue += stats.renameQueue
 			sum.renameQueueSize += stats.renameQueueSize
 			sum.deletes += stats.deletes
+			sum.deletesSize += stats.deletesSize
 			sum.deletedDirs += stats.deletedDirs
 			sum.inProgress.merge(stats.inProgress)
 			sum.startedTransfers = append(sum.startedTransfers, stats.startedTransfers...)
@@ -399,6 +412,10 @@ func (sg *statsGroups) sum(ctx context.Context) *StatsInfo {
 			stats.average.mu.Lock()
 			sum.average.speed += stats.average.speed
 			stats.average.mu.Unlock()
+			sum.serverSideCopies += stats.serverSideCopies
+			sum.serverSideCopyBytes += stats.serverSideCopyBytes
+			sum.serverSideMoves += stats.serverSideMoves
+			sum.serverSideMoveBytes += stats.serverSideMoveBytes
 		}
 		stats.mu.RUnlock()
 	}

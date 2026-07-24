@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"golang.org/x/crypto/nacl/secretbox"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/obscure"
@@ -180,7 +181,7 @@ func Decrypt(b io.ReadSeeker) (io.Reader, error) {
 
 // GetPasswordCommand gets the password using the --password-command setting
 //
-// If the the --password-command flag was not in use it returns "", nil
+// If the --password-command flag was not in use it returns "", nil
 func GetPasswordCommand(ctx context.Context) (pass string, err error) {
 	ci := fs.GetConfig(ctx)
 	if len(ci.PasswordCommand) == 0 {
@@ -274,6 +275,11 @@ func SetConfigPassword(password string) error {
 	if err != nil {
 		return err
 	}
+	// Normalize the config encryption password to reduce weird
+	// variations so that the same password always derives the same
+	// key. This is safe for the master password as it is only ever
+	// used to derive the key, never sent anywhere verbatim.
+	password = norm.NFKC.String(password)
 	// Create SHA256 has of the password
 	sha := sha256.New()
 	_, err = sha.Write([]byte("[" + password + "][rclone-config]"))

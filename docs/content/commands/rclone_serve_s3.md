@@ -26,6 +26,26 @@ docs](https://docs.aws.amazon.com/general/latest/gr/signature-version-4.html)).
 `--auth-key` is not provided then `serve s3` will allow anonymous
 access.
 
+Like all rclone flags `--auth-key` can be set via environment
+variables, in this case `RCLONE_AUTH_KEY`. Since this flag can be
+repeated, the input to `RCLONE_AUTH_KEY` is CSV encoded. Because the
+`accessKey,secretKey` has a comma in, this means it needs to be in
+quotes.
+
+```console
+export RCLONE_AUTH_KEY='"user,pass"'
+rclone serve s3 ...
+```
+
+Or to supply multiple identities:
+
+```console
+export RCLONE_AUTH_KEY='"user1,pass1","user2,pass2"'
+rclone serve s3 ...
+```
+
+Setting this variable without quotes will produce an error.
+
 Please note that some clients may require HTTPS endpoints. See [the
 SSL docs](#tls-ssl) for more information.
 
@@ -213,6 +233,12 @@ inserts leading and trailing "/" on `--baseurl`, so `--baseurl "rclone"`,
 identically.
 
 `--disable-zip` may be set to disable the zipping download option.
+
+### Protocol
+
+The server supports HTTP/1.1 and HTTP/2.  HTTP/2 is used automatically
+for TLS connections.  For non-TLS connections, HTTP/2 cleartext (h2c)
+is supported, allowing HTTP/2 without encryption.
 
 ### TLS (SSL)
 
@@ -788,6 +814,7 @@ rclone serve s3 remote:path [flags]
       --vfs-case-insensitive                   If a file name not found, find a case insensitive match
       --vfs-disk-space-total-size SizeSuffix   Specify the total space of disk (default off)
       --vfs-fast-fingerprint                   Use fast (less accurate) fingerprints for change detection
+      --vfs-handle-caching Duration            Time to keep file handle and downloaders alive after last close (default 5s)
       --vfs-links                              Translate symlinks to/from regular files with a '.rclonelink' extension for the VFS
       --vfs-metadata-extension string          Set the extension to read metadata from
       --vfs-read-ahead SizeSuffix              Extra read ahead over --buffer-size when using cache-mode full

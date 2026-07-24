@@ -17,12 +17,10 @@ Improvements:
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"path"
 	"slices"
 	"strings"
@@ -256,25 +254,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	defer megaCacheMu.Unlock()
 	srv := megaCache[opt.User]
 	if srv == nil {
-		// srv = mega.New().SetClient(fshttp.NewClient(ctx))
-
-		// Workaround for Mega's use of insecure cipher suites which are no longer supported by default since Go 1.22.
-		// Relevant issues:
-		// https://github.com/rclone/rclone/issues/8565
-		// https://github.com/meganz/webclient/issues/103
-		clt := fshttp.NewClient(ctx)
-		clt.Transport = fshttp.NewTransportCustom(ctx, func(t *http.Transport) {
-			var ids []uint16
-			// Read default ciphers
-			for _, cs := range tls.CipherSuites() {
-				ids = append(ids, cs.ID)
-			}
-			// Insecure but Mega uses TLS_RSA_WITH_AES_128_GCM_SHA256 for storage endpoints
-			// (e.g. https://gfs302n114.userstorage.mega.co.nz) as of June 18, 2025.
-			t.TLSClientConfig.CipherSuites = append(ids, tls.TLS_RSA_WITH_AES_128_GCM_SHA256)
-		})
-		srv = mega.New().SetClient(clt)
-
+		srv = mega.New().SetClient(fshttp.NewClient(ctx))
 		srv.SetRetries(ci.LowLevelRetries) // let mega do the low level retries
 		srv.SetHTTPS(opt.UseHTTPS)
 		srv.SetLogger(func(format string, v ...any) {
@@ -292,7 +272,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			if err != nil {
 				return nil, fmt.Errorf("couldn't login: %w", err)
 			}
-			megaCache[opt.User] = srv
 			m.Set(sessionIDConfigKey, srv.GetSessionID())
 			encodedMasterKey := base64.StdEncoding.EncodeToString(srv.GetMasterKey())
 			m.Set(masterKeyConfigKey, encodedMasterKey)
@@ -304,9 +283,13 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			}
 			err = srv.LoginWithKeys(opt.SessionID, decodedMasterKey)
 			if err != nil {
-				fs.Debugf(f, "login with previous auth keys failed: %v", err)
+				return nil, fmt.Errorf("login with previous auth keys failed: %w", err)
 			}
 		}
+		// Cache the session so all Fs instances of this user share
+		// it - the move code relies on all objects being in the same
+		// in-memory tree.
+		megaCache[opt.User] = srv
 	}
 	f.srv = srv
 
@@ -790,6 +773,8 @@ func (f *Fs) move(ctx context.Context, dstRemote string, srcFs *Fs, srcRemote st
 		return fmt.Errorf("server-side move failed to lookup src parent dir: %w", err)
 	}
 
+	waitEvent := f.srv.WaitEventsStart()
+
 	// move the object into its new directory if required
 	if srcDirNode != dstDirNode && srcDirNode.GetHash() != dstDirNode.GetHash() {
 		//log.Printf("move src %p %q dst %p %q", srcDirNode, srcDirNode.GetName(), dstDirNode, dstDirNode.GetName())
@@ -801,8 +786,6 @@ func (f *Fs) move(ctx context.Context, dstRemote string, srcFs *Fs, srcRemote st
 			return fmt.Errorf("server-side move failed: %w", err)
 		}
 	}
-
-	waitEvent := f.srv.WaitEventsStart()
 
 	// rename the object if required
 	if srcLeaf != dstLeaf {
@@ -1236,6 +1219,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 	}
 
+	waitEvent := o.fs.srv.WaitEventsStart()
+
 	// Finish the upload
 	var info *mega.Node
 	err = o.fs.pacer.Call(func() (bool, error) {
@@ -1255,15 +1240,23 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		o.info = nil
 	}
 
+	// Wait for the server to confirm the new file
+	o.fs.srv.WaitEvents(waitEvent, eventWaitTime)
+
 	return o.setMetaData(info)
 }
 
 // Remove an object
 func (o *Object) Remove(ctx context.Context) error {
+	waitEvent := o.fs.srv.WaitEventsStart()
+
 	err := o.fs.deleteNode(ctx, o.info)
 	if err != nil {
 		return fmt.Errorf("Remove object failed: %w", err)
 	}
+
+	// Wait for the server to confirm the deletion
+	o.fs.srv.WaitEvents(waitEvent, eventWaitTime)
 	return nil
 }
 

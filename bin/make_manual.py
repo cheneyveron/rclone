@@ -23,6 +23,7 @@ docs = [
     "gui.md",
     "rc.md",
     "overview.md",
+    "tiers.md",
     "flags.md",
     "docker.md",
     "bisync.md",
@@ -43,9 +44,11 @@ docs = [
     "compress.md",
     "combine.md",
     "doi.md",
+    "drime.md",
     "dropbox.md",
     "filefabric.md",
     "filelu.md",
+    "filen.md",
     "filescom.md",
     "ftp.md",
     "gofile.md",
@@ -53,12 +56,14 @@ docs = [
     "drive.md",
     "googlephotos.md",
     "hasher.md",
+    "huaweidrive.md",
     "hdfs.md",
     "hidrive.md",
     "http.md",
     "imagekit.md",
     "iclouddrive.md",
     "internetarchive.md",
+    "internxt.md",
     "jottacloud.md",
     "koofr.md",
     "linkbox.md",
@@ -89,7 +94,6 @@ docs = [
     "storj.md",
     "sugarsync.md",
     "ulozto.md",
-    "uptobox.md",
     "union.md",
     "webdav.md",
     "yandex.md",
@@ -132,6 +136,7 @@ ignore_docs = [
     "privacy.md",
     "sponsor.md",
     "amazonclouddrive.md",
+    "backends.md",              # Makes JSON confusingly
 ]
 
 def read_doc(doc):
@@ -141,7 +146,7 @@ def read_doc(doc):
         contents = fd.read()
     parts = contents.split("---\n", 2)
     if len(parts) != 3:
-        raise ValueError("Couldn't find --- markers: found %d parts" % len(parts))
+        raise ValueError(f"{doc}: Couldn't find --- markers: found {len(parts)} parts")
     contents = parts[2].strip()+"\n\n"
     # Remove icons
     contents = re.sub(r'<i class="fa.*?</i>\s*', "", contents)

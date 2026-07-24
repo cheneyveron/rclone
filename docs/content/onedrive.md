@@ -4,7 +4,7 @@ description: "Rclone docs for Microsoft OneDrive"
 versionIntroduced: "v1.24"
 ---
 
-# {{< icon "fab fa-windows" >}} Microsoft OneDrive
+# Microsoft OneDrive
 
 Paths are specified as `remote:path`
 
@@ -236,6 +236,41 @@ credentials.
 **NOTE** Assigning permissions directly to the application means that
 anyone with the *Client ID* and *Client Secret* can access your
 OneDrive files. Take care to safeguard these credentials.
+
+### Non-admin access to Business OneDrive
+
+If you do not have admin access to your organization's OneDrive for
+Business, you can still connect by manually providing the SharePoint
+tenant URL and drive ID. This works by overriding the base API URL
+from the standard Microsoft Graph endpoint to the SharePoint v2.0
+endpoint.
+
+#### Steps to manually obtain credentials
+
+1. Open your browser and navigate to `https://[your-tenant].sharepoint.com/`
+2. Open Developer Tools (press F12) and go to the **Network** tab.
+3. Search for `driveAccessToken` in the network requests.
+4. Extract the following information from the response:
+   ```json
+   ".driveUrl": "{tenant_url}/v2.0/drives/{drive_id}",
+   ".driveAccessToken": "access_token={access_token}"
+   ```
+
+#### Rclone configuration
+
+Use the extracted values to configure your remote:
+
+```ini
+type = onedrive
+token = {"access_token":"{access_token}","token_type":"Bearer","refresh_token":"","expiry":"2045-12-31T23:59:59Z"}
+drive_id = {drive_id}
+tenant_url = {tenant_url}
+drive_type = business
+```
+
+Since the exact expiry time cannot be determined from web traffic,
+set the expiry to a future date. Note that the token will eventually
+expire and you will need to repeat the process to obtain a new one.
 
 ### Modification times and hashes
 
@@ -788,7 +823,7 @@ This is why this flag is not set as the default.
 
 As a rule of thumb if nearly all of your data is under rclone's root
 directory (the `root/directory` in `onedrive:root/directory`) then
-using this flag will be be a big performance win. If your data is
+using this flag will be a big performance win. If your data is
 mostly not under the root then using this flag will be a big
 performance loss.
 
@@ -995,7 +1030,7 @@ Here are the possible system metadata items for the onedrive backend.
 | content-type | The MIME type of the file. | string | text/plain | **Y** |
 | created-by-display-name | Display name of the user that created the item. | string | John Doe | **Y** |
 | created-by-id | ID of the user that created the item. | string | 48d31887-5fad-4d73-a9f5-3c356e68a038 | **Y** |
-| description | A short description of the file. Max 1024 characters. Only supported for OneDrive Personal. | string | Contract for signing | N |
+| description | A short description of the file. Max 1024 characters. No longer supported by Microsoft. | string | Contract for signing | N |
 | id | The unique identifier of the item within OneDrive. | string | 01BYE5RZ6QN3ZWBTUFOFD3GSPGOHDJD36K | **Y** |
 | last-modified-by-display-name | Display name of the user that last modified the item. | string | John Doe | **Y** |
 | last-modified-by-id | ID of the user that last modified the item. | string | 48d31887-5fad-4d73-a9f5-3c356e68a038 | **Y** |
@@ -1243,7 +1278,7 @@ If you see the error above after enabling multi-factor authentication for your
 account, you can fix it by refreshing your OAuth refresh token. To do that, run
 `rclone config`, and choose to edit your OneDrive backend. Then, you don't need
 to actually make any changes until you reach this question:
-`Already have a token - refresh?`. For this question, answer `y` and go through
+`Token already configured - replace it?`. For this question, answer `y` and go through
 the process to refresh your token, just like the first time the backend is
 configured. After this, rclone should work again for this backend.
 

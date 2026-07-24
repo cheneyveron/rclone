@@ -978,7 +978,7 @@ put them back in again. -->
 - Nathanael Demacon <7271496+quantumsheep@users.noreply.github.com>
 - ahxxm <ahxxm@users.noreply.github.com>
 - Flora Thiebaut <johann.thiebaut@gmail.com>
-- kingston125 <support@filelu.com>
+- kingston125 <support@filelu.com> <kingston125@github.com>
 - Ser-Bul <30335009+Ser-Bul@users.noreply.github.com>
 - jinjingroad <jinjingroad@sina.com>
 - necaran <55765083+necaran@users.noreply.github.com>
@@ -1058,3 +1058,118 @@ put them back in again. -->
 - Tingsong Xu <tingsong.xu@rightcapital.com>
 - Jonas Tingeborn <134889+jojje@users.noreply.github.com>
 - jhasse-shade <jacob@shade.inc>
+- vyv03354 <VYV03354@nifty.ne.jp>
+- masrlinu <masrlinu@users.noreply.github.com> <5259918+masrlinu@users.noreply.github.com>
+- vupn0712 <126212736+vupn0712@users.noreply.github.com>
+- darkdragon-001 <darkdragon-001@users.noreply.github.com>
+- sys6101 <csvmen@gmail.com>
+- Nicolas Dessart <nds@outsight.tech>
+- Qingwei Li <332664203@qq.com>
+- yy <yhymmt37@gmail.com>
+- Marc-Philip <marc-philip.werner@sap.com>
+- Mikel Olasagasti Uranga <mikel@olasagasti.info>
+- Nick Owens <mischief@offblast.org>
+- hyusap <paulayush@gmail.com>
+- jzunigax2 <125698953+jzunigax2@users.noreply.github.com>
+- lullius <lullius@users.noreply.github.com>
+- StarHack <StarHack@users.noreply.github.com>
+- Leon Brocard <acme@astray.com>
+- Cohinem <143964778+Cohinem@users.noreply.github.com>
+- Jack Kelly <jack@OpenClimateFix.org>
+- Prakhar Chhalotre <chhalotreprakhar00@gmail.com>
+- Varun Chawla <34209028+veeceey@users.noreply.github.com>
+- Jan-Philipp Reßler <75355263+TabError@users.noreply.github.com>
+- Shlomi Avihou <shlomi@zadarastorage.com>
+- Chris <238498929+chris081519-crypto@users.noreply.github.com>
+- Jan-Philipp Reßler <xodarap@xodarap.de>
+- Dark Dragon <darkdragon-001@web.de>
+- Leon Brocard <lbrocard@fastly.com>
+- a1pcm <a1pcm@users.noreply.github.com>
+- FTCHD <144691102+FTCHD@users.noreply.github.com>
+- Bjoern Franke <bjo+git@schafweide.org>
+- hxnd <callmehxnd@outlook.de>
+- Adam Kasztenny <adamkasztenny@gmail.com>
+- Romāns Potašovs <justgook@gmail.com>
+- Brian Bockelman <bbockelman@morgridge.org>
+- Bjoern Franke <bjo@schafweide.org>
+- razorloves <razorloves@gmail.com>
+- Duncan F <131309315+duncanaf@users.noreply.github.com>
+- Billy Hughes <w.g.h.hughes@gmail.com>
+- Bhagyashreek8 <57988406+Bhagyashreek8@users.noreply.github.com>
+- Andriy Senyshyn <135705861+sam-mt@users.noreply.github.com>
+- Andrew Furman <7343697+furmandev@users.noreply.github.com>
+- ZRHan <56144550+ZRHann@users.noreply.github.com>
+- Jason <jasonbabo@gmail.com>
+- Patrick Farrell <pfarrell@whamcloud.com>
+- BizaNator <17164422+BizaNator@users.noreply.github.com>
+- lif <1835304752@qq.com>
+- jinkeyuu <44105232+jinkeyuu@users.noreply.github.com>
+- jinyu.han <jinyu.han@ucloud.cn>
+- Claude Opus 4.6 <noreply@anthropic.com>
+- Andriy Senyshyn <andriy.senyshyn@kiteworks.com>
+- Mike GIllan <mike.gillan@gmail.com>
+- Xiangzhe <xiangzhedev@gmail.com>
+- Suyun <suyun@aosc.io>
+- TheBabu <ariq.haqq@gmail.com>
+- Brais Couce <braiscouce@gmail.com>
+- Mozi <29089388+pzhlkj6612@users.noreply.github.com>
+- SyoBoN <syobon@syobon.net>
+- Jan Heylen <heyleke@gmail.com>
+- tdawe <90407556+tdawe1@users.noreply.github.com>
+- Anton Bordwine <54022438+antonchuvashow@users.noreply.github.com>
+- mathieulongtin <617359+mathieulongtin@users.noreply.github.com>
+- Luke Cyca <me@lukecyca.com>
+- dlaumen <262192488+dlaumen@users.noreply.github.com>
+- Yakov Till <37628546+Lyapsus@users.noreply.github.com>
+- Chris Coughlan <chris@coughlan.io>
+- John Volk <volkjohn@users.noreply.github.com>
+- 王一赫 <wyihe5220@gmail.com>
+- Gustavo V. F. <31892323+Gustavo-V-F@users.noreply.github.com>
+- Sven Rebhan <36194019+srebhan@users.noreply.github.com>
+- Copilot <223556219+Copilot@users.noreply.github.com>
+- KTibow <KTibow@users.noreply.github.com>
+- kkocdko <31189892+kkocdko@users.noreply.github.com>
+- Tim Schumacher <tim@tschumacher.net>
+- ferrumclaudepilgrim <ferrumclaudepilgrim@users.noreply.github.com>
+- Alvinwylim <31592545+Alvinwylim@users.noreply.github.com>
+- Tore Anderson <tore@fud.no>
+- Sai Asish Y <say.apm35@gmail.com>
+- Lucky945H <1355363613@qq.com>
+- William Tange <github@tan.ge>
+- TaterLi <admin@lijingquan.net>
+- KyokoMiki <161209740+kyokomiki@users.noreply.github.com>
+- Iizuki <36295229+Iizuki@users.noreply.github.com>
+- tomholford <16504501+tomholford@users.noreply.github.com> <tomholford@users.noreply.github.com>
+- caltechustc <caltechustc@outlook.com>
+- Valerij Fredriksen <freva@users.noreply.github.com>
+- Hakan İSMAİL <93117749+Hakanbaban53@users.noreply.github.com>
+- Brian King <BrianDKing@gmail.com>
+- Puneet Dixit <puneetdixit4321@gmail.com>
+- Yakov Till <yakov.till@gmail.com>
+- Janne Beate Bakeng <436265+jbbakeng@users.noreply.github.com>
+- IceLocke <lockeice@gmail.com>
+- nako-ruru <nako_ruru@163.com>
+- bright <nako_ruru@sina.com>
+- Filippo <57143294+FilippoMuschera@users.noreply.github.com>
+- Gaurav <amvermagaurav007@gmail.com>
+- Yuhang Cao <caoyuhang@fwerkor.com>
+- Yash Anil <yashanil98@gmail.com>
+- yashanil98 <79158725+yashanil98@users.noreply.github.com>
+- lewoberst <github@jan-o-sch.net>
+- max <max@example.com>
+- Bryan Stenson <bryan.stenson@gmail.com>
+- happysnaker <73147033+happysnaker@users.noreply.github.com>
+- Jan Schlien <rclone-github@jan-o-sch.net>
+- user77 <abubakarm@gmail.com>
+- maximilize <3752128+maximilize@users.noreply.github.com>
+- dithwick <46924962+dithwick@users.noreply.github.com>
+- Sandy Luppino <s.luppino@opendrives.com>
+- Sanjays2402 <51058514+Sanjays2402@users.noreply.github.com>
+- blackflytech <blackflytech@outlook.com>
+- Amit Mishra <amit.mishra.eee21@itbhu.ac.in>
+- Erol Ozcan <erol.ozcan@gmail.com>
+- TowyTowy <towy@airreps.link>
+- 0rangeSeaW0lf <0sw-8m4k2v@waku.li>
+- sijie-Z <sijie-zhou@users.noreply.github.com>
+- Søren Lindberg <deeferentleeg@gmail.com>
+- Kyue <Gooh456@users.noreply.github.com>

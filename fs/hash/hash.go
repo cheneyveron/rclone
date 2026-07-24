@@ -114,6 +114,11 @@ func (h *xxh128Hasher) Sum(b []byte) []byte {
 	return buf[:]
 }
 
+// Size returns the number of bytes Sum will return.
+func (h *xxh128Hasher) Size() int {
+	return 16
+}
+
 func init() {
 	MD5 = RegisterHash("md5", "MD5", 32, md5.New)
 	SHA1 = RegisterHash("sha1", "SHA-1", 40, sha1.New)
@@ -225,7 +230,7 @@ func fromTypes(set Set) (map[Type]hash.Hash, error) {
 // single multiwriter, where one write will update all
 // the hashers.
 func toMultiWriter(h map[Type]hash.Hash) io.Writer {
-	// Convert to to slice
+	// Convert to slice
 	var w = make([]io.Writer, 0, len(h))
 	for _, v := range h {
 		w = append(w, v)
