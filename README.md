@@ -30,6 +30,7 @@ directories to and from different cloud storage providers.
 - ArvanCloud Object Storage (AOS) [:page_facing_up:](https://rclone.org/s3/#arvan-cloud-object-storage-aos)
 - Bizfly Cloud Simple Storage [:page_facing_up:](https://rclone.org/s3/#bizflycloud)
 - Backblaze B2 [:page_facing_up:](https://rclone.org/b2/)
+- Baidu Netdisk [:page_facing_up:](https://rclone.org/baidunetdisk/)
 - Box [:page_facing_up:](https://rclone.org/box/)
 - Ceph [:page_facing_up:](https://rclone.org/s3/#ceph)
 - China Mobile Ecloud Elastic Object Storage (EOS) [:page_facing_up:](https://rclone.org/s3/#china-mobile-ecloud-eos)

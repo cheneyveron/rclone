@@ -1,4 +1,4 @@
-// Package baidunetdisk provides an interface to Baidu Netdisk (百度网盘) xPan API
+// Package baidunetdisk provides an interface to the Baidu Netdisk (百度网盘) xPan API.
 package baidunetdisk
 
 import (
@@ -12,7 +12,6 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/rclone/rclone/backend/baidunetdisk/api"
@@ -20,8 +19,8 @@ import (
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/fserrors"
-	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/oauthutil"
@@ -29,10 +28,9 @@ import (
 	"github.com/rclone/rclone/lib/rest"
 )
 
-// Constants
 const (
-	rcloneClientID     = "HMHCuMZzPBj02oGjm4LKLQGE8v8MsyK6"
-	rcloneClientSecret = "bUF3tdHJYxQQHwCT9J0JBP8Ll3J4sMwi"
+	rcloneClientID              = "HMHCuMZzPBj02oGjm4LKLQGE8v8MsyK6"
+	rcloneEncryptedClientSecret = "CD7DNAMAED8tRCTvY9Cd9NXu-FDyoz8NUxbmwqCIr0_kNT2EW8aEf3GrMmOBnyWf"
 
 	minSleep       = 10 * time.Millisecond
 	maxSleep       = 2 * time.Second
@@ -41,30 +39,58 @@ const (
 	uploadRootURL  = "https://d.pcs.baidu.com"
 	defaultAppName = "rclone" // App folder name in /apps/
 
-	// Baidu requires this User-Agent for downloads
-	baiduUserAgent = "netdisk;7.0.3.2;PC;PC-Windows;10.0.19043;WindowsBaiduYunGuanJia"
-
-	// Upload chunk size - Baidu requires 4MB chunks
-	defaultChunkSize = 4 * 1024 * 1024 // 4MB
+	// Baidu's download CDN requires this value in the User-Agent.
+	baiduUserAgent = "pan.baidu.com"
 
 	// List limit per page
 	listPageSize = 1000
+
+	defaultEncoding = encoder.EncodeCtl |
+		encoder.EncodeSlash |
+		encoder.EncodeBackSlash |
+		encoder.EncodeDoubleQuote |
+		encoder.EncodeInvalidUtf8
 )
 
-// Globals
-var (
-	oauthConfig = oauthutil.Config{
-		Scopes: []string{
-			"basic",
-			"netdisk",
-		},
-		AuthURL:     "https://openapi.baidu.com/oauth/2.0/authorize",
-		TokenURL:    "https://openapi.baidu.com/oauth/2.0/token",
-		RedirectURL: oauthutil.RedirectURL,
+// retryErrorCodes is a slice of HTTP status codes that will be retried.
+var retryErrorCodes = []int{
+	http.StatusTooManyRequests,
+	http.StatusInternalServerError,
+	http.StatusBadGateway,
+	http.StatusServiceUnavailable,
+	http.StatusGatewayTimeout,
+	509, // Bandwidth Limit Exceeded
+}
+
+var oauthConfig = &oauthutil.Config{
+	Scopes: []string{
+		"basic",
+		"netdisk",
+	},
+	AuthURL:  "https://openapi.baidu.com/oauth/2.0/authorize",
+	TokenURL: "https://openapi.baidu.com/oauth/2.0/token",
+	ClientID: rcloneClientID,
+	ClientSecret: obscure.MustReveal(
+		rcloneEncryptedClientSecret,
+	),
+	RedirectURL: oauthutil.RedirectURL,
+}
+
+func oauthOptions() []fs.Option {
+	options := append([]fs.Option(nil), oauthutil.SharedOptions[:3]...)
+	for i := range options {
+		switch options[i].Name {
+		case config.ConfigClientID:
+			options[i].Help = "OAuth Client Id.\n\nLeave blank to use rclone's default client ID."
+			options[i].Advanced = true
+		case config.ConfigClientSecret:
+			options[i].Help = "OAuth Client Secret.\n\nLeave blank to use rclone's default client secret."
+			options[i].Advanced = true
+		}
 	}
-)
+	return options
+}
 
-// Register with Fs
 func init() {
 	fs.Register(&fs.RegInfo{
 		Name:        "baidunetdisk",
@@ -72,18 +98,10 @@ func init() {
 		NewFs:       NewFs,
 		Config: func(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
 			return oauthutil.ConfigOut("", &oauthutil.Options{
-				OAuth2Config: &oauthConfig,
+				OAuth2Config: oauthConfig,
 			})
 		},
-		Options: []fs.Option{{
-			Name:     "client_id",
-			Help:     "OAuth Client Id.\n\nLeave blank to use rclone's default client ID.",
-			Advanced: true,
-		}, {
-			Name:     "client_secret",
-			Help:     "OAuth Client Secret.\n\nLeave blank to use rclone's default client secret.",
-			Advanced: true,
-		}, {
+		Options: append(oauthOptions(), []fs.Option{{
 			Name:     "app_name",
 			Default:  defaultAppName,
 			Help:     "App name in /apps/ folder.\n\nBaidu Netdisk stores files under /apps/{app_name}/ path.",
@@ -92,16 +110,12 @@ func init() {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
-			Default: (encoder.EncodeCtl |
-				encoder.EncodeSlash |
-				encoder.EncodeBackSlash |
-				encoder.EncodeDoubleQuote |
-				encoder.EncodeInvalidUtf8),
-		}},
+			Default:  defaultEncoding,
+		}}...),
 	})
 }
 
-// Options defines the configuration for this backend
+// Options defines the configuration for this backend.
 type Options struct {
 	ClientID     string               `config:"client_id"`
 	ClientSecret string               `config:"client_secret"`
@@ -109,7 +123,7 @@ type Options struct {
 	Enc          encoder.MultiEncoder `config:"encoding"`
 }
 
-// Fs represents a remote Baidu Netdisk
+// Fs represents a remote Baidu Netdisk.
 type Fs struct {
 	name     string       // name of this remote
 	root     string       // the path we are working on (relative to /apps/{app_name}/)
@@ -120,11 +134,9 @@ type Fs struct {
 	pacer    *fs.Pacer    // pacer for API calls
 	client   *http.Client // authorized http client
 	ts       *oauthutil.TokenSource
-	m        configmap.Mapper
-	mu       sync.Mutex // protect token refresh
 }
 
-// Object describes a Baidu Netdisk object
+// Object describes a Baidu Netdisk object.
 type Object struct {
 	fs      *Fs       // reference to the Fs
 	remote  string    // the remote path
@@ -137,32 +149,32 @@ type Object struct {
 
 // ------------------------------------------------------------
 
-// Name of the remote (as passed into NewFs)
+// Name returns the name of the remote as passed to NewFs.
 func (f *Fs) Name() string {
 	return f.name
 }
 
-// Root of the remote (as passed into NewFs)
+// Root returns the root of the remote as passed to NewFs.
 func (f *Fs) Root() string {
 	return f.root
 }
 
-// String converts this Fs to a string
+// String returns a description of this Fs.
 func (f *Fs) String() string {
 	return fmt.Sprintf("Baidu Netdisk root '%s'", f.root)
 }
 
-// Features returns the optional features of this Fs
+// Features returns the optional features of this Fs.
 func (f *Fs) Features() *fs.Features {
 	return f.features
 }
 
-// Precision return the precision of this Fs
+// Precision returns the supported modification time precision.
 func (f *Fs) Precision() time.Duration {
-	return time.Second
+	return fs.ModTimeNotSupported
 }
 
-// Hashes returns the supported hash sets
+// Hashes returns the supported hash types.
 func (f *Fs) Hashes() hash.Set {
 	return hash.Set(hash.MD5)
 }
@@ -174,31 +186,31 @@ func parsePath(p string) string {
 	return strings.Trim(p, "/")
 }
 
-// absPath returns the absolute path on Baidu Netdisk
-func (f *Fs) absPath(remote string) string {
-	// Build the path without trailing slashes
-	if f.root == "" && remote == "" {
-		return f.appRoot
+// validatePath ensures a relative path cannot escape the application root.
+func validatePath(p string) error {
+	for _, part := range strings.Split(p, "/") {
+		if part == ".." {
+			return fmt.Errorf("path traversal is not allowed: %q", p)
+		}
 	}
-	if remote == "" {
-		return f.appRoot + "/" + f.root
-	}
-	return f.appRoot + "/" + path.Join(f.root, remote)
+	return nil
 }
 
-// relPath returns the relative path from the appRoot
-func (f *Fs) relPath(absPath string) string {
-	prefix := f.appRoot + "/"
-	if strings.HasPrefix(absPath, prefix) {
-		result := strings.TrimPrefix(absPath, prefix)
-		if f.root != "" && strings.HasPrefix(result, f.root+"/") {
-			return strings.TrimPrefix(result, f.root+"/")
-		} else if result == f.root {
-			return ""
-		}
-		return result
+// validateAppName ensures appName represents one folder directly below /apps.
+func validateAppName(appName string) error {
+	if appName == "" || appName == "." || appName == ".." || strings.Contains(appName, "/") || strings.Contains(appName, `\`) {
+		return fmt.Errorf("app_name must be a single folder name, got %q", appName)
 	}
-	return absPath
+	return nil
+}
+
+// absPath returns the absolute path on Baidu Netdisk
+func (f *Fs) absPath(remote string) string {
+	relative := f.opt.Enc.FromStandardPath(path.Join(f.root, remote))
+	if relative == "" {
+		return f.appRoot
+	}
+	return f.appRoot + "/" + relative
 }
 
 // errorHandler parses a non 2xx error response into an error
@@ -223,14 +235,6 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 	if fserrors.ContextError(ctx, &err) {
 		return false, err
 	}
-	if err == nil {
-		return false, nil
-	}
-
-	// Retry on rate limit
-	if resp != nil && resp.StatusCode == 429 {
-		return true, err
-	}
 
 	// Check for specific Baidu errors
 	var apiErr *api.Error
@@ -247,44 +251,71 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 		}
 	}
 
-	return fserrors.ShouldRetry(err), err
+	retry := fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes)
+	if retry && err == nil && resp != nil {
+		err = fmt.Errorf("HTTP error: %s", resp.Status)
+	}
+	return retry, err
 }
 
-// getClient creates an HTTP client with the auth token
-func (f *Fs) getClient(ctx context.Context) *http.Client {
-	return fshttp.NewClient(ctx)
+// callJSON runs an API call through the pacer and converts response errno values to errors.
+func (f *Fs) callJSON(ctx context.Context, opts *rest.Opts, result any, errno *int) error {
+	var resp *http.Response
+	var err error
+	return f.pacer.Call(func() (bool, error) {
+		if seeker, ok := opts.Body.(io.Seeker); ok {
+			if _, err = seeker.Seek(0, io.SeekStart); err != nil {
+				return false, fmt.Errorf("failed to rewind request body: %w", err)
+			}
+		}
+		resp, err = f.srv.CallJSON(ctx, opts, nil, result)
+		if err == nil && *errno != api.ErrnoSuccess {
+			err = &api.Error{Errno: *errno}
+		}
+		return shouldRetry(ctx, resp, err)
+	})
 }
 
-// NewFs constructs an Fs from the path, container:path
+func isAPIError(err error, codes ...int) bool {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	for _, code := range codes {
+		if apiErr.Errno == code {
+			return true
+		}
+	}
+	return false
+}
+
+// NewFs constructs an Fs from the supplied remote name, root, and configuration.
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
 	if err != nil {
 		return nil, err
 	}
-
-	// Override client credentials if provided
-	if opt.ClientID != "" && opt.ClientSecret != "" {
-		oauthConfig.ClientID = opt.ClientID
-		oauthConfig.ClientSecret = opt.ClientSecret
-	} else {
-		oauthConfig.ClientID = rcloneClientID
-		oauthConfig.ClientSecret = rcloneClientSecret
+	if err = validateAppName(opt.AppName); err != nil {
+		return nil, err
+	}
+	root = parsePath(root)
+	if err = validatePath(root); err != nil {
+		return nil, err
 	}
 
-	oAuthClient, ts, err := oauthutil.NewClient(ctx, name, m, &oauthConfig)
+	oAuthClient, ts, err := oauthutil.NewClient(ctx, name, m, oauthConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create oauth client: %w", err)
 	}
 
 	f := &Fs{
 		name:    name,
-		root:    parsePath(root),
+		root:    root,
 		appRoot: "/apps/" + opt.AppName,
 		opt:     *opt,
 		client:  oAuthClient,
 		ts:      ts,
-		m:       m,
 		pacer:   fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 
@@ -292,7 +323,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		CanHaveEmptyDirectories: true,
 		ReadMimeType:            false,
 		WriteMimeType:           false,
-		NoMultiThreading:        true, // Baidu requires seekable input for two-pass upload
+		NoMultiThreading:        true, // Baidu multipart uploads require an ordered two-pass source.
 	}).Fill(ctx, f)
 
 	// Create REST client
@@ -302,19 +333,21 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if f.root != "" {
 		absRoot := f.absPath("")
 		info, err := f.getFileInfo(ctx, absRoot)
-		if err == nil {
-			if info.IsDir == 0 {
-				// Root is a file - set root to parent directory
-				newRoot := path.Dir(f.root)
-				if newRoot == "." {
-					newRoot = ""
-				}
-				f.root = newRoot
-				return f, fs.ErrorIsFile
+		if err != nil {
+			if !errors.Is(err, fs.ErrorObjectNotFound) {
+				return nil, fmt.Errorf("failed to read root %q: %w", f.root, err)
 			}
+			return f, nil
 		}
-		// If error is ErrorObjectNotFound, the path doesn't exist as a file
-		// Check if it could be a directory that doesn't exist yet (which is fine)
+		if info.IsDir == 0 {
+			// Root is a file - set root to parent directory
+			newRoot := path.Dir(f.root)
+			if newRoot == "." {
+				newRoot = ""
+			}
+			f.root = newRoot
+			return f, fs.ErrorIsFile
+		}
 	}
 
 	return f, nil
@@ -332,46 +365,42 @@ func (f *Fs) addToken(params url.Values) error {
 
 // getFileInfo gets file info from path
 func (f *Fs) getFileInfo(ctx context.Context, absPath string) (*api.File, error) {
-	// First, try to get the parent directory listing to find the file
 	parentPath := path.Dir(absPath)
 	filename := path.Base(absPath)
-
-	params := url.Values{
-		"method": {"list"},
-		"dir":    {parentPath},
-		"limit":  {strconv.Itoa(listPageSize)},
-	}
-	if err := f.addToken(params); err != nil {
-		return nil, err
-	}
-
-	opts := rest.Opts{
-		Method:     "GET",
-		Path:       "/rest/2.0/xpan/file",
-		Parameters: params,
-	}
-
-	var result api.ListResponse
-	var resp *http.Response
-	var err error
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
-		return nil, err
-	}
-	if result.Errno != 0 {
-		return nil, &api.Error{Errno: result.Errno}
-	}
-
-	for _, file := range result.List {
-		if file.ServerFilename == filename {
-			return file, nil
+	start := 0
+	for {
+		params := url.Values{
+			"method": {"list"},
+			"dir":    {parentPath},
+			"start":  {strconv.Itoa(start)},
+			"limit":  {strconv.Itoa(listPageSize)},
 		}
+		if err := f.addToken(params); err != nil {
+			return nil, err
+		}
+		opts := rest.Opts{
+			Method:     http.MethodGet,
+			Path:       "/rest/2.0/xpan/file",
+			Parameters: params,
+		}
+		var result api.ListResponse
+		err := f.callJSON(ctx, &opts, &result, &result.Errno)
+		if err != nil {
+			if isAPIError(err, api.ErrnoPathNotExist, api.ErrnoFileNotExist) {
+				return nil, fs.ErrorObjectNotFound
+			}
+			return nil, err
+		}
+		for _, file := range result.List {
+			if file.ServerFilename == filename {
+				return file, nil
+			}
+		}
+		if len(result.List) == 0 || (result.HasMore == 0 && len(result.List) < listPageSize) {
+			return nil, fs.ErrorObjectNotFound
+		}
+		start += len(result.List)
 	}
-
-	return nil, fs.ErrorObjectNotFound
 }
 
 // getFileMetas gets file metadata including download link
@@ -397,23 +426,19 @@ func (f *Fs) getFileMetas(ctx context.Context, fsIDs []int64) ([]*api.File, erro
 	}
 
 	var result api.FileMetasResponse
-	var resp *http.Response
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		return shouldRetry(ctx, resp, err)
-	})
+	err = f.callJSON(ctx, &opts, &result, &result.Errno)
 	if err != nil {
 		return nil, err
-	}
-	if result.Errno != 0 {
-		return nil, &api.Error{Errno: result.Errno}
 	}
 
 	return result.List, nil
 }
 
-// List the objects and directories in dir into entries
+// List returns the objects and directories in dir.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	if err = validatePath(dir); err != nil {
+		return nil, err
+	}
 	absDir := f.absPath(dir)
 
 	start := 0
@@ -435,19 +460,12 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		}
 
 		var result api.ListResponse
-		var resp *http.Response
-		err = f.pacer.Call(func() (bool, error) {
-			resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-			return shouldRetry(ctx, resp, err)
-		})
+		err = f.callJSON(ctx, &opts, &result, &result.Errno)
 		if err != nil {
-			return nil, err
-		}
-		if result.Errno != 0 {
-			if result.Errno == api.ErrnoPathNotExist || result.Errno == api.ErrnoFileNotExist {
+			if isAPIError(err, api.ErrnoPathNotExist, api.ErrnoFileNotExist) {
 				return nil, fs.ErrorDirNotFound
 			}
-			return nil, &api.Error{Errno: result.Errno}
+			return nil, err
 		}
 
 		for _, item := range result.List {
@@ -469,7 +487,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			}
 		}
 
-		if len(result.List) < listPageSize {
+		if len(result.List) == 0 || (result.HasMore == 0 && len(result.List) < listPageSize) {
 			break
 		}
 		start += len(result.List)
@@ -478,8 +496,11 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	return entries, nil
 }
 
-// NewObject finds the Object at remote
+// NewObject finds the Object at remote.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	if err := validatePath(remote); err != nil {
+		return nil, err
+	}
 	absPath := f.absPath(remote)
 	info, err := f.getFileInfo(ctx, absPath)
 	if err != nil {
@@ -500,9 +521,12 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	}, nil
 }
 
-// Put uploads a file
+// Put uploads a file.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	remote := src.Remote()
+	if err := validatePath(remote); err != nil {
+		return nil, err
+	}
 	size := src.Size()
 
 	o := &Object{
@@ -518,8 +542,16 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	return o, nil
 }
 
-// Mkdir creates the directory if it doesn't exist
+// PutStream uploads an object of unknown size.
+func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	return f.Put(ctx, in, src, options...)
+}
+
+// Mkdir creates the directory if it doesn't exist.
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	if err := validatePath(dir); err != nil {
+		return err
+	}
 	absPath := f.absPath(dir)
 	return f.mkdir(ctx, absPath)
 }
@@ -549,24 +581,25 @@ func (f *Fs) mkdir(ctx context.Context, absPath string) error {
 	}
 
 	var result api.CreateResponse
-	var resp *http.Response
-	var err error
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		return shouldRetry(ctx, resp, err)
-	})
+	err := f.callJSON(ctx, &opts, &result, &result.Errno)
+	if isAPIError(err, api.ErrnoFileAlreadyExist, api.ErrnoFileAlreadyExist2) {
+		return nil
+	}
+	return err
+}
+
+// Rmdir removes the directory if it is empty.
+func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	if err := validatePath(dir); err != nil {
+		return err
+	}
+	entries, err := f.List(ctx, dir)
 	if err != nil {
 		return err
 	}
-	if result.Errno != 0 && result.Errno != api.ErrnoFileAlreadyExist && result.Errno != api.ErrnoFileAlreadyExist2 {
-		return &api.Error{Errno: result.Errno}
+	if len(entries) != 0 {
+		return fs.ErrorDirectoryNotEmpty
 	}
-
-	return nil
-}
-
-// Rmdir removes the directory if empty
-func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	absPath := f.absPath(dir)
 	return f.delete(ctx, absPath)
 }
@@ -600,24 +633,26 @@ func (f *Fs) delete(ctx context.Context, absPath string) error {
 	}
 
 	var result api.FileManagerResponse
-	var resp *http.Response
-	var err2 error
-	err2 = f.pacer.Call(func() (bool, error) {
-		resp, err2 = f.srv.CallJSON(ctx, &opts, nil, &result)
-		return shouldRetry(ctx, resp, err2)
-	})
-	if err2 != nil {
-		return err2
+	if err = f.callJSON(ctx, &opts, &result, &result.Errno); err != nil {
+		return err
 	}
-	if result.Errno != 0 {
-		return &api.Error{Errno: result.Errno}
-	}
+	return fileManagerResultError(&result)
+}
 
+func fileManagerResultError(result *api.FileManagerResponse) error {
+	for _, info := range result.Info {
+		if info.Errno != api.ErrnoSuccess {
+			return fmt.Errorf("file operation failed for %q: %w", info.Path, &api.Error{Errno: info.Errno})
+		}
+	}
 	return nil
 }
 
-// Copy copies a remote object
+// Copy copies a remote object.
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	if err := validatePath(remote); err != nil {
+		return nil, err
+	}
 	srcObj, ok := src.(*Object)
 	if !ok {
 		fs.Debugf(src, "Can't copy - not same remote type")
@@ -637,8 +672,11 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	return f.NewObject(ctx, remote)
 }
 
-// Move moves a remote object
+// Move moves a remote object.
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	if err := validatePath(remote); err != nil {
+		return nil, err
+	}
 	srcObj, ok := src.(*Object)
 	if !ok {
 		fs.Debugf(src, "Can't move - not same remote type")
@@ -658,8 +696,14 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	return f.NewObject(ctx, remote)
 }
 
-// DirMove moves a directory
+// DirMove moves a directory.
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+	if err := validatePath(srcRemote); err != nil {
+		return err
+	}
+	if err := validatePath(dstRemote); err != nil {
+		return err
+	}
 	srcFs, ok := src.(*Fs)
 	if !ok {
 		fs.Debugf(src, "Can't DirMove - not same remote type")
@@ -697,6 +741,7 @@ func (f *Fs) fileManager(ctx context.Context, op api.FileManagerOp, srcPath, des
 	form := url.Values{
 		"async":    {"2"}, // 0=sync, 1=adaptive, 2=async
 		"filelist": {string(fileListJSON)},
+		"ondup":    {"overwrite"},
 	}
 
 	opts := rest.Opts{
@@ -708,16 +753,11 @@ func (f *Fs) fileManager(ctx context.Context, op api.FileManagerOp, srcPath, des
 	}
 
 	var result api.FileManagerResponse
-	var resp *http.Response
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
+	if err = f.callJSON(ctx, &opts, &result, &result.Errno); err != nil {
 		return err
 	}
-	if result.Errno != 0 {
-		return &api.Error{Errno: result.Errno}
+	if err = fileManagerResultError(&result); err != nil {
+		return err
 	}
 
 	// If async task, wait for it
@@ -746,13 +786,7 @@ func (f *Fs) waitForTask(ctx context.Context, taskID int64) error {
 		}
 
 		var result api.TaskQueryResponse
-		var resp *http.Response
-		var err error
-		err = f.pacer.Call(func() (bool, error) {
-			resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-			return shouldRetry(ctx, resp, err)
-		})
-		if err != nil {
+		if err := f.callJSON(ctx, &opts, &result, &result.Errno); err != nil {
 			return err
 		}
 
@@ -774,7 +808,7 @@ func (f *Fs) waitForTask(ctx context.Context, taskID int64) error {
 	}
 }
 
-// About gets quota information
+// About returns quota information.
 func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	params := url.Values{
 		"checkfree":   {"1"},
@@ -791,17 +825,9 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	}
 
 	var result api.QuotaResponse
-	var resp *http.Response
-	var err error
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		return shouldRetry(ctx, resp, err)
-	})
+	err := f.callJSON(ctx, &opts, &result, &result.Errno)
 	if err != nil {
 		return nil, err
-	}
-	if result.Errno != 0 {
-		return nil, &api.Error{Errno: result.Errno}
 	}
 
 	return &fs.Usage{
@@ -814,17 +840,17 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 // ------------------------------------------------------------
 // Object methods
 
-// Fs returns the parent Fs
+// Fs returns the parent Fs.
 func (o *Object) Fs() fs.Info {
 	return o.fs
 }
 
-// Remote returns the remote path
+// Remote returns the remote path.
 func (o *Object) Remote() string {
 	return o.remote
 }
 
-// String returns a string representation
+// String returns a string representation of the object.
 func (o *Object) String() string {
 	if o == nil {
 		return "<nil>"
@@ -832,27 +858,27 @@ func (o *Object) String() string {
 	return o.remote
 }
 
-// Size returns the size of the object
+// Size returns the size of the object.
 func (o *Object) Size() int64 {
 	return o.size
 }
 
-// ModTime returns the modification time
+// ModTime returns the modification time.
 func (o *Object) ModTime(ctx context.Context) time.Time {
 	return o.modTime
 }
 
-// SetModTime sets the modification time (not supported)
+// SetModTime returns an error because Baidu Netdisk does not support it.
 func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 	return fs.ErrorCantSetModTime
 }
 
-// Storable returns whether the object is storable
+// Storable reports whether the object can be stored.
 func (o *Object) Storable() bool {
 	return true
 }
 
-// Hash returns the MD5 hash
+// Hash returns the MD5 hash.
 func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
 	if ty != hash.MD5 {
 		return "", hash.ErrUnsupported
@@ -872,7 +898,7 @@ func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
 	return md5, nil
 }
 
-// Open opens the object for reading
+// Open opens the object for reading.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	// Get fresh download link
 	files, err := o.fs.getFileMetas(ctx, []int64{o.fsID})
@@ -883,8 +909,11 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return nil, fs.ErrorObjectNotFound
 	}
 
-	dlink := files[0].DLink
-	if dlink == "" {
+	downloadURL, err := url.Parse(files[0].DLink)
+	if err != nil {
+		return nil, fmt.Errorf("invalid download link: %w", err)
+	}
+	if downloadURL.String() == "" {
 		return nil, errors.New("no download link available")
 	}
 
@@ -894,54 +923,54 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return nil, fmt.Errorf("failed to get access token: %w", err)
 	}
 
-	// Add access token to download link
-	if strings.Contains(dlink, "?") {
-		dlink += "&access_token=" + token.AccessToken
-	} else {
-		dlink += "?access_token=" + token.AccessToken
-	}
-
-	// Create request with proper User-Agent
-	req, err := http.NewRequestWithContext(ctx, "GET", dlink, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", baiduUserAgent)
+	query := downloadURL.Query()
+	query.Set("access_token", token.AccessToken)
+	downloadURL.RawQuery = query.Encode()
 
 	// Apply options (Range header for partial downloads)
 	fs.FixRangeOption(options, o.size)
-	fs.OpenOptionAddHTTPHeaders(req.Header, options)
 
-	// Make request
-	resp, err := o.fs.client.Do(req)
+	var resp *http.Response
+	err = o.fs.pacer.Call(func() (bool, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL.String(), nil)
+		if err != nil {
+			return false, err
+		}
+		req.Header.Set("User-Agent", baiduUserAgent)
+		fs.OpenOptionAddHTTPHeaders(req.Header, options)
+		resp, err = o.fs.client.Do(req)
+		if err == nil && resp.StatusCode >= http.StatusBadRequest {
+			err = errorHandler(resp)
+		}
+		if err != nil && resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return shouldRetry(ctx, resp, err)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("download request failed: %w", err)
-	}
-
-	if resp.StatusCode >= 400 {
-		_ = resp.Body.Close()
-		return nil, fmt.Errorf("download failed with status %d", resp.StatusCode)
 	}
 
 	return resp.Body, nil
 }
 
-// Update updates the object with new content
+// Update updates the object with new content.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	return o.upload(ctx, in, src.Size(), options...)
 }
 
-// Remove removes the object
+// Remove removes the object.
 func (o *Object) Remove(ctx context.Context) error {
 	return o.fs.delete(ctx, o.path)
 }
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs       = (*Fs)(nil)
-	_ fs.Copier   = (*Fs)(nil)
-	_ fs.Mover    = (*Fs)(nil)
-	_ fs.DirMover = (*Fs)(nil)
-	_ fs.Abouter  = (*Fs)(nil)
-	_ fs.Object   = (*Object)(nil)
+	_ fs.Fs          = (*Fs)(nil)
+	_ fs.Copier      = (*Fs)(nil)
+	_ fs.Mover       = (*Fs)(nil)
+	_ fs.DirMover    = (*Fs)(nil)
+	_ fs.Abouter     = (*Fs)(nil)
+	_ fs.PutStreamer = (*Fs)(nil)
+	_ fs.Object      = (*Object)(nil)
 )

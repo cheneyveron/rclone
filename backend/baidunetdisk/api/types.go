@@ -2,15 +2,16 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 )
 
 // Error represents API error from Baidu Netdisk
 type Error struct {
-	Errno     int    `json:"errno"`
-	ErrMsg    string `json:"errmsg,omitempty"`
-	RequestID int64  `json:"request_id,omitempty"`
+	Errno     int         `json:"errno"`
+	ErrMsg    string      `json:"errmsg,omitempty"`
+	RequestID json.Number `json:"request_id,omitempty"`
 }
 
 // Error returns a string for the error and satisfies the error interface
@@ -87,10 +88,10 @@ type Thumbs struct {
 
 // ListResponse is the response from list API
 type ListResponse struct {
-	Errno    int     `json:"errno"`
-	GuidInfo string  `json:"guid_info,omitempty"`
-	List     []*File `json:"list"`
-	HasMore  int     `json:"has_more,omitempty"` // 0 = no more, 1 = has more (only for some APIs)
+	Errno   int     `json:"errno"`
+	GUID    int64   `json:"guid,omitempty"`
+	List    []*File `json:"list"`
+	HasMore int     `json:"has_more,omitempty"` // 0 = no more, 1 = has more (only for some APIs)
 }
 
 // FileMetasRequest is the request for filemetas API
@@ -112,7 +113,7 @@ type PrecreateRequest struct {
 	IsDir     int    `json:"isdir"`
 	AutoInit  int    `json:"autoinit"`
 	BlockList string `json:"block_list"` // JSON array of MD5 hashes
-	RType     int    `json:"rtype"`      // 0=default, 1=rename if exists, 2=rename with path, 3=overwrite
+	RType     int    `json:"rtype"`      // 0=fail on conflict, 1=rename, 2=overwrite
 }
 
 // PrecreateResponse is the response from precreate API
@@ -126,9 +127,9 @@ type PrecreateResponse struct {
 
 // SuperfileResponse is the response from superfile2 upload API
 type SuperfileResponse struct {
-	Errno     int    `json:"errno"`
-	MD5       string `json:"md5,omitempty"`
-	RequestID int64  `json:"request_id,omitempty"`
+	Errno     int         `json:"errno"`
+	MD5       string      `json:"md5,omitempty"`
+	RequestID json.Number `json:"request_id,omitempty"`
 }
 
 // CreateRequest is the request for create API (finalize upload)
@@ -138,7 +139,7 @@ type CreateRequest struct {
 	IsDir     int    `json:"isdir"`
 	UploadID  string `json:"uploadid"`
 	BlockList string `json:"block_list"` // JSON array of MD5 hashes
-	RType     int    `json:"rtype"`      // 0=default, 1=rename if exists, 2=rename with path, 3=overwrite
+	RType     int    `json:"rtype"`      // 0=fail on conflict, 1=rename, 2=overwrite
 }
 
 // CreateResponse is the response from create API
@@ -160,9 +161,13 @@ type CreateResponse struct {
 type FileManagerOp string
 
 const (
-	FileManagerOpCopy   FileManagerOp = "copy"
-	FileManagerOpMove   FileManagerOp = "move"
+	// FileManagerOpCopy copies a file or directory.
+	FileManagerOpCopy FileManagerOp = "copy"
+	// FileManagerOpMove moves a file or directory.
+	FileManagerOpMove FileManagerOp = "move"
+	// FileManagerOpRename renames a file or directory.
 	FileManagerOpRename FileManagerOp = "rename"
+	// FileManagerOpDelete deletes a file or directory.
 	FileManagerOpDelete FileManagerOp = "delete"
 )
 

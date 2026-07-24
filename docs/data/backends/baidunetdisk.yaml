@@ -7,7 +7,7 @@ integration_tests: Disabled
 data_integrity: Hash
 performance: Low
 adoption: Some use
-docs: Basic
+docs: Full
 security: High
 virtual: false
 remote: 'TestBaiduNetdisk:'
@@ -18,6 +18,7 @@ features:
 - DirMove
 - Move
 - NoMultiThreading
+- PutStream
 hashes:
 - md5
-precision: 1000000000
+precision: 3153600000000000000

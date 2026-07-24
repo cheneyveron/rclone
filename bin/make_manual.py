@@ -35,6 +35,7 @@ docs = [
     "s3.md",
     "archive.md",
     "b2.md",
+    "baidunetdisk.md",
     "box.md",
     "cache.md",
     "chunker.md",
