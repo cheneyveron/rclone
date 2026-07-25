@@ -19,6 +19,9 @@ ANALYZER = Path(__file__).with_name("analyze_bdpan_xor.py")
 TEXT_ADDRESS = 0x401000
 PCLN_ADDRESS = 0x402000
 REAL_BDPAN_SHA256 = "f4d80c4cc97ddd3bcc230f2c82ab96d9be32cbe8e27f7fcc91cb23bb27b62d58"
+DEFAULT_CREDENTIALS_OUTPUT = Path(
+    "/home/hermes/.hermes/secrets/baidu-netdisk-bdpan-cli.yaml"
+)
 SYNTHETIC_CONTENT = (
     "SYNTHETIC_APP_CLIENT_CONTENT_DO_NOT_REPORT",
     "SYNTHETIC_SECRET_CONTENT_DO_NOT_REPORT",
@@ -220,6 +223,18 @@ print(outputs.get(start, ""))
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+def read_secret_record(path: Path) -> dict[str, object]:
+    """read_secret_record parses the analyzer's JSON-compatible YAML scalars."""
+
+    record: dict[str, object] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        name, separator, value = line.partition(":")
+        if not separator:
+            continue
+        record[name] = json.loads(value.strip())
+    return record
+
+
 class AnalyzerIntegrationTest(unittest.TestCase):
     """AnalyzerIntegrationTest exercises both compiler layouts end to end."""
 
@@ -239,12 +254,20 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         self,
         binary: Path,
         objdump: Path | None = None,
+        credentials_output: Path | None = None,
+        force: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, object] | None]:
         """run_analyzer invokes the CLI and decodes a successful JSON report."""
 
         command = [sys.executable, "-B", os.fspath(ANALYZER), "--json"]
         if objdump is not None:
             command.extend(["--objdump", os.fspath(objdump)])
+        if credentials_output is not None:
+            command.extend(
+                ["--credentials-output", os.fspath(credentials_output)]
+            )
+        if force:
+            command.append("--force")
         command.append(os.fspath(binary))
         result = subprocess.run(
             command,
@@ -283,6 +306,18 @@ class AnalyzerIntegrationTest(unittest.TestCase):
                 privacy["disassembly_emitted"],
                 privacy["operands_emitted"],
             )
+            credentials_export = report.get("credentials_export")
+            if credentials_export is not None:
+                assert isinstance(credentials_export, dict)
+                LOGGER.debug(
+                    "credentials export written=%s path=%s mode=%s fields=%s "
+                    "values_emitted=%s",
+                    credentials_export["written"],
+                    credentials_export["path"],
+                    credentials_export["file_mode"],
+                    credentials_export["credential_fields_written"],
+                    credentials_export["credential_values_emitted"],
+                )
         return result, report
 
     def run_text_analyzer(
@@ -395,6 +430,23 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         emitted = text_result.stdout + text_result.stderr
         for content in SYNTHETIC_CONTENT:
             self.assertNotIn(content, emitted)
+
+        rejected_output = self.directory / "credentials.yaml"
+        rejected_result, rejected_report = self.run_analyzer(
+            binary,
+            objdump,
+            credentials_output=rejected_output,
+        )
+        self.assertIsNone(rejected_report)
+        self.assertEqual(rejected_result.returncode, 2)
+        self.assertFalse(rejected_output.exists())
+        self.assertIn(
+            "credential output must be a YAML file directly under",
+            rejected_result.stderr,
+        )
+        rejected_emitted = rejected_result.stdout + rejected_result.stderr
+        for content in SYNTHETIC_CONTENT:
+            self.assertNotIn(content, rejected_emitted)
 
     def test_zeroing_xor_is_not_classified_as_a_decoder(self) -> None:
         """Register-zeroing XOR instructions are a negative control."""
@@ -510,10 +562,20 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         "set BDPAN_3_8_4_BINARY to run the real-binary regression",
     )
     def test_real_bdpan_3_8_4_regression(self) -> None:
-        """The downloaded 3.8.4 binary retains the expected private structure."""
+        """The 3.8.4 binary writes a validated record without console disclosure."""
 
         binary = Path(os.environ["BDPAN_3_8_4_BINARY"])
-        result, report = self.run_analyzer(binary)
+        credentials_output = Path(
+            os.environ.get(
+                "BDPAN_CREDENTIALS_OUTPUT",
+                os.fspath(DEFAULT_CREDENTIALS_OUTPUT),
+            )
+        )
+        result, report = self.run_analyzer(
+            binary,
+            credentials_output=credentials_output,
+            force=True,
+        )
         self.assertIsNotNone(report, result.stderr)
         assert report is not None
         self.assert_private_report(result, report)
@@ -525,6 +587,36 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         self.assertEqual(assessment["xor_loop_count"], 2)
         self.assertEqual(assessment["xor_loops_with_modulo_count"], 2)
         self.assertTrue(assessment["credential_path_confirmed"])
+
+        credentials_export = report.get("credentials_export")
+        self.assertIsInstance(credentials_export, dict)
+        assert isinstance(credentials_export, dict)
+        self.assertTrue(credentials_export["written"])
+        self.assertEqual(credentials_export["path"], os.fspath(credentials_output))
+        self.assertEqual(credentials_export["file_mode"], "0600")
+        self.assertEqual(credentials_export["credential_fields_written"], 2)
+        self.assertEqual(credentials_export["credential_values_emitted"], 0)
+
+        self.assertTrue(credentials_output.is_file())
+        self.assertEqual(
+            stat.S_IMODE(credentials_output.stat().st_mode),
+            0o600,
+        )
+        record = read_secret_record(credentials_output)
+        app_key = record.get("api_key")
+        secret_key = record.get("secret_key")
+        self.assertTrue(
+            isinstance(app_key, str) and len(app_key) == 32,
+            "api_key must be a populated 32-byte string",
+        )
+        self.assertTrue(
+            isinstance(secret_key, str) and len(secret_key) == 32,
+            "secret_key must be a populated 32-byte string",
+        )
+        self.assertTrue(
+            app_key != secret_key,
+            "credential fields must contain distinct values",
+        )
 
 
 if __name__ == "__main__":

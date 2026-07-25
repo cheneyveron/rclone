@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze bdpan's embedded credential XOR routine without revealing credentials.
+"""Analyze bdpan's embedded credential XOR routine without console disclosure.
 
 The script reads a stripped Go ELF binary, recovers function boundaries from
 ``.gopclntab``, and asks GNU objdump for instruction metadata.  Its reporter is
@@ -8,7 +8,9 @@ values, strings, raw data, decoded buffers, or credential-derived hashes.
 
 Only structural facts are reported, such as function sizes, code hashes,
 instruction counts, loop evidence, and whether standalone or compiler-inlined
-credential helpers lead to the XOR decoder.
+credential helpers lead to the XOR decoder.  For a verified binary profile, an
+explicit option can atomically write the decoded client record directly under
+``/home/hermes/.hermes/secrets`` without printing its values.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import dataclasses
+import datetime
 import hashlib
 import json
 import os
@@ -24,8 +27,12 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Iterable
+
+
+SECRETS_ROOT = Path("/home/hermes/.hermes/secrets")
 
 
 class AnalysisError(Exception):
@@ -65,6 +72,30 @@ class Instruction:
     address: int
     mnemonic: str
     operands: str
+
+
+@dataclasses.dataclass(frozen=True)
+class CredentialLayout:
+    """CredentialLayout identifies Go slice descriptors in a verified binary."""
+
+    profile: str
+    xor_key: int
+    app_key: int
+    secret_key: int
+    expected_length: int
+
+
+KNOWN_CREDENTIAL_LAYOUTS = {
+    "f4d80c4cc97ddd3bcc230f2c82ab96d9be32cbe8e27f7fcc91cb23bb27b62d58": (
+        CredentialLayout(
+            profile="bdpan-3.8.4-linux-amd64",
+            xor_key=0x145C1F0,
+            app_key=0x145C230,
+            secret_key=0x145C250,
+            expected_length=32,
+        )
+    ),
+}
 
 
 class ELFImage:
@@ -155,9 +186,23 @@ class ELFImage:
             raise AnalysisError("invalid function address interval")
         for section in self.sections.values():
             if section.address <= start and end <= section.address + section.size:
+                if section.section_type == 8:
+                    raise AnalysisError("requested address has no file-backed data")
                 offset = section.offset + start - section.address
                 return self._slice(offset, end - start, "function body")
         raise AnalysisError("function body is not contained in one ELF section")
+
+    def go_slice_bytes(self, descriptor_address: int) -> bytes:
+        """go_slice_bytes reads one validated 64-bit Go slice descriptor."""
+
+        descriptor = self.address_bytes(
+            descriptor_address,
+            descriptor_address + 24,
+        )
+        pointer, length, capacity = struct.unpack("<QQQ", descriptor)
+        if length == 0 or length > 4096 or capacity < length:
+            raise AnalysisError("credential slice descriptor is invalid")
+        return self.address_bytes(pointer, pointer + length)
 
     def section_for_address(self, address: int) -> Section | None:
         """section_for_address returns the section containing address."""
@@ -570,6 +615,133 @@ def build_assessment(
     }
 
 
+def decode_credential(encoded: bytes, xor_key: bytes, expected_length: int) -> str:
+    """decode_credential decodes and validates one credential without emitting it."""
+
+    if len(encoded) != expected_length or len(xor_key) != expected_length:
+        raise AnalysisError("verified credential layout has unexpected slice lengths")
+    decoded = bytes(
+        value ^ xor_key[index % len(xor_key)]
+        for index, value in enumerate(encoded)
+    )
+    try:
+        credential = decoded.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise AnalysisError("decoded credential failed validation") from error
+    if not credential or any(character.isspace() for character in credential):
+        raise AnalysisError("decoded credential failed validation")
+    if any(ord(character) < 0x21 or ord(character) > 0x7E for character in credential):
+        raise AnalysisError("decoded credential failed validation")
+    return credential
+
+
+def credentials_output_path(output: Path) -> Path:
+    """credentials_output_path validates a direct YAML child of the secrets root."""
+
+    try:
+        root = SECRETS_ROOT.resolve(strict=True)
+        parent = output.parent.resolve(strict=True)
+    except OSError as error:
+        raise AnalysisError("credential output directory is unavailable") from error
+    if parent != root or output.suffix != ".yaml":
+        raise AnalysisError(
+            f"credential output must be a YAML file directly under {SECRETS_ROOT}"
+        )
+    if output.is_symlink():
+        raise AnalysisError("credential output must not be a symbolic link")
+    return root / output.name
+
+
+def credential_record(app_key: str, secret_key: str, profile: str) -> bytes:
+    """credential_record serializes the approved secret-template fields as YAML."""
+
+    fields = {
+        "name": "Baidu Netdisk bdpan CLI OAuth client",
+        "url": "https://pan.baidu.com",
+        "host": "pan.baidu.com",
+        "api_key": app_key,
+        "secret_key": secret_key,
+        "notes": f"Extracted from verified {profile} binary; values are never logged",
+        "updated": datetime.date.today().isoformat(),
+    }
+    return (
+        "".join(
+            f"{name}: {json.dumps(value, ensure_ascii=True)}\n"
+            for name, value in fields.items()
+        )
+    ).encode("utf-8")
+
+
+def write_credentials(
+    binary: Path,
+    output: Path,
+    force: bool,
+) -> dict[str, object]:
+    """write_credentials extracts a known profile directly into the secrets root."""
+
+    destination = credentials_output_path(output)
+    if destination.exists() and not force:
+        raise AnalysisError("credential output already exists; pass --force to replace it")
+
+    image = ELFImage(binary)
+    binary_sha256 = hashlib.sha256(image.data).hexdigest()
+    layout = KNOWN_CREDENTIAL_LAYOUTS.get(binary_sha256)
+    if layout is None:
+        raise AnalysisError("credential export is unsupported for this binary fingerprint")
+
+    xor_key = image.go_slice_bytes(layout.xor_key)
+    app_key = decode_credential(
+        image.go_slice_bytes(layout.app_key),
+        xor_key,
+        layout.expected_length,
+    )
+    secret_key = decode_credential(
+        image.go_slice_bytes(layout.secret_key),
+        xor_key,
+        layout.expected_length,
+    )
+    if app_key == secret_key:
+        raise AnalysisError("decoded credential fields failed validation")
+
+    record = credential_record(app_key, secret_key, layout.profile)
+    temporary_path: Path | None = None
+    descriptor: int | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            dir=destination.parent,
+        )
+        temporary_path = Path(temporary_name)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(record)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, destination)
+        temporary_path = None
+        os.chmod(destination, 0o600)
+    except OSError as error:
+        raise AnalysisError("unable to write credential output") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    return {
+        "written": True,
+        "path": os.fspath(destination),
+        "profile": layout.profile,
+        "file_mode": "0600",
+        "credential_fields_written": 2,
+        "credential_values_emitted": 0,
+    }
+
+
 def analyze(binary: Path, objdump: str) -> dict[str, object]:
     """analyze returns a sanitized report for binary."""
 
@@ -709,6 +881,23 @@ def render_text(report: dict[str, object]) -> str:
             f"  operands_emitted: {str(privacy['operands_emitted']).lower()}",
         ]
     )
+    credentials_export = report.get("credentials_export")
+    if credentials_export is not None:
+        assert isinstance(credentials_export, dict)
+        lines.extend(
+            [
+                "",
+                "credentials_export:",
+                f"  written: {str(credentials_export['written']).lower()}",
+                f"  path: {credentials_export['path']}",
+                f"  profile: {credentials_export['profile']}",
+                f"  file_mode: {credentials_export['file_mode']}",
+                "  credential_fields_written: "
+                + str(credentials_export["credential_fields_written"]),
+                "  credential_values_emitted: "
+                + str(credentials_export["credential_values_emitted"]),
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -732,6 +921,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="objdump",
         help="GNU objdump executable (default: objdump)",
     )
+    parser.add_argument(
+        "--credentials-output",
+        type=Path,
+        metavar="YAML",
+        help=(
+            "write a verified binary profile's OAuth client record to a YAML "
+            f"file directly under {SECRETS_ROOT}; values are never printed"
+        ),
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="replace an existing --credentials-output file",
+    )
     return parser.parse_args(argv)
 
 
@@ -739,6 +942,9 @@ def main(argv: list[str] | None = None) -> int:
     """main runs the command-line analyzer."""
 
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.force and args.credentials_output is None:
+        print("error: --force requires --credentials-output", file=sys.stderr)
+        return 2
     objdump = shutil.which(args.objdump)
     if objdump is None:
         print("error: objdump was not found", file=sys.stderr)
@@ -746,6 +952,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         report = analyze(args.binary, objdump)
+        if args.credentials_output is not None:
+            report["credentials_export"] = write_credentials(
+                args.binary,
+                args.credentials_output,
+                args.force,
+            )
     except AnalysisError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
