@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 import struct
@@ -23,6 +24,18 @@ SYNTHETIC_CONTENT = (
     "SYNTHETIC_SECRET_CONTENT_DO_NOT_REPORT",
     "SYNTHETIC_XOR_KEY_CONTENT_DO_NOT_REPORT",
 )
+LOGGER = logging.getLogger("bdpan_xor_test")
+
+
+def configure_debug_logging() -> None:
+    """configure_debug_logging enables safe test diagnostics on the console."""
+
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="DEBUG %(name)s: %(message)s",
+        stream=sys.stderr,
+        force=True,
+    )
 
 
 def align(value: int, alignment: int) -> int:
@@ -212,6 +225,11 @@ class AnalyzerIntegrationTest(unittest.TestCase):
 
     maxDiff = None
 
+    @classmethod
+    def setUpClass(cls) -> None:
+        configure_debug_logging()
+        LOGGER.debug("starting privacy-safe bdpan XOR analyzer tests")
+
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
@@ -237,6 +255,34 @@ class AnalyzerIntegrationTest(unittest.TestCase):
             timeout=30,
         )
         report = json.loads(result.stdout) if result.returncode == 0 else None
+        LOGGER.debug(
+            "analyzer target=%s format=json objdump=%s exit_code=%d",
+            binary,
+            objdump if objdump is not None else "system-default",
+            result.returncode,
+        )
+        if report is not None:
+            assessment = report["assessment"]
+            privacy = report["privacy"]
+            assert isinstance(assessment, dict)
+            assert isinstance(privacy, dict)
+            LOGGER.debug(
+                "analysis mode=%s xor_loops=%s modulo_loops=%s "
+                "credential_path_confirmed=%s",
+                report["analysis_mode"],
+                assessment["xor_loop_count"],
+                assessment["xor_loops_with_modulo_count"],
+                assessment["credential_path_confirmed"],
+            )
+            LOGGER.debug(
+                "privacy content_disclosed=%s raw_bytes=%s decoded_values=%s "
+                "disassembly=%s operands=%s",
+                privacy["content_disclosed"],
+                privacy["raw_bytes_emitted"],
+                privacy["decoded_values_emitted"],
+                privacy["disassembly_emitted"],
+                privacy["operands_emitted"],
+            )
         return result, report
 
     def run_text_analyzer(
@@ -246,7 +292,7 @@ class AnalyzerIntegrationTest(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         """run_text_analyzer invokes the human-readable reporter."""
 
-        return subprocess.run(
+        result = subprocess.run(
             [
                 sys.executable,
                 "-B",
@@ -261,6 +307,13 @@ class AnalyzerIntegrationTest(unittest.TestCase):
             text=True,
             timeout=30,
         )
+        LOGGER.debug(
+            "analyzer target=%s format=text objdump=%s exit_code=%d",
+            binary,
+            objdump,
+            result.returncode,
+        )
+        return result
 
     def assert_private_report(
         self,
