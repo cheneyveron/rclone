@@ -19,7 +19,6 @@ import (
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
-	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
@@ -29,15 +28,16 @@ import (
 )
 
 const (
-	rcloneClientID              = "HMHCuMZzPBj02oGjm4LKLQGE8v8MsyK6"
-	rcloneEncryptedClientSecret = "CD7DNAMAED8tRCTvY9Cd9NXu-FDyoz8NUxbmwqCIr0_kNT2EW8aEf3GrMmOBnyWf"
+	bdpanXORKey                 = "\xc1\x83\x47\x19\x89\xce\x14\x72\x82\x15\xa7\x69\x4a\x24\x27\xe8\xec\xec\xf2\xf4\x9a\x7a\x47\x0c\xdd\xe0\xc4\xe5\x76\x12\xb5\xcd"
+	bdpanXOREncodedClientID     = "\xbb\xc5\x72\x72\xe2\x80\x67\x31\xf4\x76\xcc\x31\x7e\x45\x6e\x98\xbe\x88\xba\x8c\xea\x3c\x2c\x6f\x8e\xad\xbc\x8b\x31\x48\xde\xb4"
+	bdpanXOREncodedClientSecret = "\xaa\xed\x04\x6c\xd3\x98\x4d\x28\xe3\x26\xdd\x27\x0f\x46\x6c\x8a\x85\xab\x82\xcc\xdb\x4a\x29\x47\xb7\xa5\xb4\xa3\x00\x42\xf1\xbd"
 
 	minSleep       = 10 * time.Millisecond
 	maxSleep       = 2 * time.Second
 	decayConstant  = 2
 	rootURL        = "https://pan.baidu.com"
 	uploadRootURL  = "https://d.pcs.baidu.com"
-	defaultAppName = "rclone" // App folder name in /apps/
+	defaultAppName = "bdpan" // App folder name in /apps/
 
 	// Baidu's download CDN requires this value in the User-Agent.
 	baiduUserAgent = "pan.baidu.com"
@@ -62,18 +62,27 @@ var retryErrorCodes = []int{
 	509, // Bandwidth Limit Exceeded
 }
 
+func mustXORDecode(encoded, key string) string {
+	if len(key) == 0 {
+		panic("baidunetdisk: empty OAuth credential XOR key")
+	}
+	decoded := make([]byte, len(encoded))
+	for i := range encoded {
+		decoded[i] = encoded[i] ^ key[i%len(key)]
+	}
+	return string(decoded)
+}
+
 var oauthConfig = &oauthutil.Config{
 	Scopes: []string{
 		"basic",
 		"netdisk",
 	},
-	AuthURL:  "https://openapi.baidu.com/oauth/2.0/authorize",
-	TokenURL: "https://openapi.baidu.com/oauth/2.0/token",
-	ClientID: rcloneClientID,
-	ClientSecret: obscure.MustReveal(
-		rcloneEncryptedClientSecret,
-	),
-	RedirectURL: oauthutil.RedirectURL,
+	AuthURL:      "https://openapi.baidu.com/oauth/2.0/authorize",
+	TokenURL:     "https://openapi.baidu.com/oauth/2.0/token",
+	ClientID:     mustXORDecode(bdpanXOREncodedClientID, bdpanXORKey),
+	ClientSecret: mustXORDecode(bdpanXOREncodedClientSecret, bdpanXORKey),
+	RedirectURL:  oauthutil.RedirectURL,
 }
 
 func oauthOptions() []fs.Option {
@@ -81,10 +90,10 @@ func oauthOptions() []fs.Option {
 	for i := range options {
 		switch options[i].Name {
 		case config.ConfigClientID:
-			options[i].Help = "OAuth Client Id.\n\nLeave blank to use rclone's default client ID."
+			options[i].Help = "OAuth Client Id.\n\nLeave blank to use the built-in bdpan client ID."
 			options[i].Advanced = true
 		case config.ConfigClientSecret:
-			options[i].Help = "OAuth Client Secret.\n\nLeave blank to use rclone's default client secret."
+			options[i].Help = "OAuth Client Secret.\n\nLeave blank to use the built-in bdpan client secret."
 			options[i].Advanced = true
 		}
 	}

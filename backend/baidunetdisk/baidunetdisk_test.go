@@ -137,6 +137,40 @@ func TestOAuthOptionsAndConfigIsolation(t *testing.T) {
 	}
 }
 
+func TestXORDecode(t *testing.T) {
+	const (
+		plain = "oauth-client"
+		key   = "xor"
+	)
+	encoded := make([]byte, len(plain))
+	for i := range plain {
+		encoded[i] = plain[i] ^ key[i%len(key)]
+	}
+	if got := mustXORDecode(string(encoded), key); got != plain {
+		t.Fatalf("mustXORDecode() = %q, want %q", got, plain)
+	}
+}
+
+func TestEmbeddedOAuthCredentials(t *testing.T) {
+	if len(bdpanXORKey) != 32 ||
+		len(bdpanXOREncodedClientID) != 32 ||
+		len(bdpanXOREncodedClientSecret) != 32 {
+		t.Fatal("embedded OAuth XOR material must contain three 32-byte values")
+	}
+	if len(oauthConfig.ClientID) != 32 || len(oauthConfig.ClientSecret) != 32 {
+		t.Fatal("decoded OAuth credentials must contain two 32-byte values")
+	}
+	if oauthConfig.ClientID == oauthConfig.ClientSecret {
+		t.Fatal("decoded OAuth credentials must be distinct")
+	}
+}
+
+func TestDefaultAppNameMatchesEmbeddedOAuthClient(t *testing.T) {
+	if defaultAppName != "bdpan" {
+		t.Fatalf("defaultAppName = %q, want bdpan", defaultAppName)
+	}
+}
+
 func TestAPIResponsesAcceptStringRequestID(t *testing.T) {
 	var result api.SuperfileResponse
 	if err := json.Unmarshal([]byte(`{"errno":0,"request_id":"123"}`), &result); err != nil {

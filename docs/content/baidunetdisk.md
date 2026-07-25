@@ -19,7 +19,7 @@ Baidu restricts an application to its own directory under
 `/apps/{app_name}/`. Rclone treats that directory as the top level of the
 remote and rejects paths that attempt to escape it.
 
-The default rclone OAuth credentials use `/apps/rclone/`. When using your own
+The built-in bdpan OAuth credentials use `/apps/bdpan/`. When using your own
 OAuth client ID and secret, set the advanced `app_name` option to the app name
 registered for those credentials. A mismatch normally results in Baidu API
 error `-6` (user not authorized).
