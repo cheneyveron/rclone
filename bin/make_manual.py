@@ -78,6 +78,7 @@ docs = [
     "opendrive.md",
     "oracleobjectstorage/_index.md",
     "qingstor.md",
+    "quark.md",
     "quatrix.md",
     "sia.md",
     "swift.md",
