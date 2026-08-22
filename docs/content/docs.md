@@ -83,7 +83,7 @@ See the following for detailed instructions for
 - [put.io](/putio/)
 - [Proton Drive](/protondrive/)
 - [QingStor](/qingstor/)
-- [Quark Drive](/quark/)
+- [Quark Drive (upload-only)](/quark/)
 - [Quatrix by Maytech](/quatrix/)
 - [rsync.net](/sftp/#rsync-net)
 - [Seafile](/seafile/)

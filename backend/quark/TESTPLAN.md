@@ -1,24 +1,24 @@
-# Quark backend test plan
+# Quark Drive backend test plan
 
-The backend is considered ready when the mock protocol tests, the standard
-rclone backend suite, and the live-account tests all pass.
+The backend is upload-only because the open platform cannot enumerate or
+delete files. The standard backend integration suite is therefore not
+applicable.
 
-| Capability | Mock test | Live verification |
-| --- | --- | --- |
-| QR login, pending polling, expiry, cookie persistence | `TestConfigQRCodeLogin*` | configure `TestQuark:` by scanning a fresh code |
-| Root paths, listing, pagination, exact name preservation | `TestFileAPIRequests`, `TestListAllPaginationAndNamePreservation` | standard `fstests` |
-| Recursive listing / `--fast-list` | `TestListRRecursesDirectories` | standard `fstests` ListR mode |
-| Empty, unknown-size, instant and multipart upload | `TestUploadZeroByte`, `TestUploadInstantAndUnknownSize`, `TestUploadMultipart` | standard Put/PutStream tests plus `TestLiveMultipart` |
-| Safe overwrite | `TestUpdateUsesTemporaryNameThenReplaces` | standard update test |
-| Download, ranges and async task polling | `TestDownloadURLSyncAndRange`, `TestDownloadURLAsync` | standard read and seek tests |
-| Size, modification time and MIME type | upload and listing tests | standard object tests |
-| File/folder create, delete, move and rename | `TestFileAPIRequests`, `TestRmdirRejectsNonEmptyDirectory` | standard `fstests` |
-| Server-side copy | `TestCopyRequest` | standard copy test |
-| Directory move and scoped purge | standard interface tests | standard `fstests` |
-| Capacity and account information | `TestAbout`, `TestUserInfo` | standard About test and a live account read |
-| Public file/folder links and unlink | `TestCreatePublicLink`, `TestUnlinkPublicLinks` | standard PublicLink test plus `TestLivePublicLinkUnlink` |
+Unit tests use a local HTTP server to cover:
 
-Provider-specific features without a Quark equivalent, such as Google-native
-document export, OneDrive drive types, organization ACLs, or native change
-notifications, are outside the parity denominator. Unsupported features must
-remain unadvertised rather than being emulated unreliably.
+- open-platform request signatures and access-token query parameters;
+- idempotent nested directory creation;
+- proof fields, multipart SHA-1 contexts, part uploads, hash update, and upload
+  completion;
+- object-storage retry behavior without leaking the access token;
+- access-token rotation and persistence of replacement credentials;
+- explicit errors for listing, reading, and deleting.
+
+A credentialed smoke test should upload a small directory with a unique target:
+
+```console
+rclone copy ./testdata TestQuark:smoke/UNIQUE-RUN-ID --no-traverse -vv
+```
+
+Verify the result in the Quark Drive application. Never reuse the smoke-test
+destination, since the backend cannot inspect or remove it.

@@ -1,145 +1,141 @@
 ---
 title: "Quark Drive"
-description: "Rclone docs for Quark Drive"
+description: "Rclone docs for upload-only Quark Drive backups"
 versionIntroduced: "v1.75"
 ---
 
 # Quark Drive
 
-[Quark Drive](https://pan.quark.cn/) is a cloud storage service.
+[Quark Drive](https://pan.quark.cn/) is a cloud storage service. This backend
+uses the Quark Drive open platform and is deliberately limited to creating
+directories and uploading files.
 
-Paths are specified as `remote:path` and may be as deep as required, for
-example `remote:directory/subdirectory`.
+## Important limitations
+
+The open platform used by this backend does not provide directory enumeration
+or file deletion. Consequently this backend cannot inspect, download, replace,
+or remove existing objects.
+
+Use it only for append-only backups with all of the following safeguards:
+
+- run `rclone copy` with `--no-traverse`;
+- use a new destination directory for every backup run;
+- do not use `sync`, `move`, `delete`, `purge`, `check`, `ls`, `mount`, or
+  restore commands with this backend.
+
+For example:
+
+```console
+rclone copy /srv/data quark:backups/2026-08-22T220000Z --no-traverse
+```
+
+Reusing a destination path is unsafe because rclone cannot determine what is
+already there. Retention and restore must be managed outside this backend,
+such as through the Quark Drive application.
 
 ## Configuration
 
-Run the interactive configuration and choose `quark`:
+Obtain the `access_token`, `refresh_token`, `user_id`, and `device_id` from an
+authorized Quark Drive open-platform application, then run:
 
 ```console
 rclone config
 ```
 
-Rclone displays a QR code and a fallback URL. Scan the code with the Quark
-mobile application, approve the login, then confirm in rclone. The resulting
-session is stored in the rclone configuration in obscured form.
+Choose `quark` and enter those values. Configure `refresh_token` for unattended
+scheduled backups; when the access token expires, rclone rotates the tokens and
+persists the replacements in its configuration.
 
-An abbreviated configuration session looks like this:
+The `root_folder_id` is normally left blank. Set it to a known directory FID to
+place every backup below that directory, or explicitly set it to `0` for the
+drive root.
 
-```text
-No remotes found, make a new one?
-n) New remote
-s) Set configuration password
-q) Quit config
-n/s/q> n
+## Upload behavior
 
-Enter name for new remote.
-name> remote
+Each source is spooled to a temporary file so rclone can calculate the MD5,
+SHA-1, proof codes, and multipart SHA-1 state required by the open platform.
+The host therefore needs enough temporary disk space for each concurrently
+uploaded source file.
 
-Option Storage.
-Type of storage to configure.
-Storage> quark
-
-Scan this QR code with the Quark app, then confirm.
-[QR code]
-
-Configuration complete.
-Options:
-- type: quark
-Keep this "remote" remote?
-y/e/d> y
-```
-
-The stored session cookie grants access to the account. Protect the rclone
-configuration file as a credential. If the session expires, authenticate again
-with:
-
-```console
-rclone config reconnect remote:
-```
-
-Once configured, common commands include:
-
-```console
-rclone lsd remote:
-rclone copy /home/source remote:backup
-rclone sync /home/source remote:backup
-```
-
-### Modification times and hashes
-
-Quark Drive records upload modification times with millisecond precision.
-Existing objects cannot have only their modification time changed.
-
-The file listing and information APIs do not expose a persistent content hash,
-so this backend does not advertise hash support. Rclone still validates sizes
-and transfer errors in the normal way.
-
-### File names
-
-The backend encodes names that Quark Drive would otherwise reject, including
-control characters, invalid UTF-8, backslashes, leading spaces and trailing
-spaces or periods. Percent sequences in names are preserved literally. Quark
-Drive normalizes Unicode names, so canonically equivalent names cannot coexist
-in one directory.
-
-### Uploads
-
-Uploads are spooled to a temporary file so rclone can calculate the hashes
-required by Quark Drive before starting the transfer. This also allows streamed
-and unknown-size input. Large files use multipart uploads; `chunk_size` can
-override the part size recommended by the service.
-
-Updating an existing file uploads a replacement first and removes the old
-object only after the new upload has completed.
-
-### Supported operations
-
-The backend supports empty directories, recursive listing (`--fast-list`),
-streamed uploads, range downloads, server-side copy, file and directory moves,
-purge, public links, quota reporting and account information.
-
-Quark Drive does not expose native equivalents for rclone metadata updates,
-change notifications, storage tiers or directory modification-time updates.
+Uploaded files retain their source modification time with millisecond
+precision. The backend does not expose hashes after upload because it cannot
+look objects up again.
 
 <!-- markdownlint-disable line-length -->
 <!-- autogenerated options start - DO NOT EDIT - instead edit fs.RegInfo in backend/quark/quark.go and run make backenddocs to verify --> <!-- markdownlint-disable-line line-length -->
 ### Standard options
 
-Here are the Standard options specific to quark (Quark Drive).
+Here are the Standard options specific to quark (Quark Drive open platform (upload-only)).
 
-#### --quark-cookie
+#### --quark-access-token
 
-Quark Drive session cookie generated by QR login.
+Long-lived access token issued by the Quark Drive open platform.
 
 **NB** Input to this must be obscured - see [rclone obscure](/commands/rclone_obscure/).
 
 Properties:
 
-- Config:      cookie
-- Env Var:     RCLONE_QUARK_COOKIE
+- Config:      access_token
+- Env Var:     RCLONE_QUARK_ACCESS_TOKEN
 - Type:        string
-- Required:    false
+- Required:    true
 
-### Advanced options
+#### --quark-refresh-token
 
-Here are the Advanced options specific to quark (Quark Drive).
+Refresh token used to renew an expired access token.
 
-#### --quark-user-agent
-
-User agent used for Quark Drive API requests.
+**NB** Input to this must be obscured - see [rclone obscure](/commands/rclone_obscure/).
 
 Properties:
 
-- Config:      user_agent
-- Env Var:     RCLONE_QUARK_USER_AGENT
+- Config:      refresh_token
+- Env Var:     RCLONE_QUARK_REFRESH_TOKEN
 - Type:        string
-- Default:     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+- Required:    false
+
+#### --quark-user-id
+
+Quark Drive user ID used to generate upload proof codes.
+
+Properties:
+
+- Config:      user_id
+- Env Var:     RCLONE_QUARK_USER_ID
+- Type:        string
+- Required:    true
+
+### Advanced options
+
+Here are the Advanced options specific to quark (Quark Drive open platform (upload-only)).
+
+#### --quark-device-id
+
+Device ID associated with the open-platform authorization.
+
+Properties:
+
+- Config:      device_id
+- Env Var:     RCLONE_QUARK_DEVICE_ID
+- Type:        string
+- Default:     "wild_claw"
+
+#### --quark-platform
+
+Device platform sent to the open platform.
+
+Properties:
+
+- Config:      platform
+- Env Var:     RCLONE_QUARK_PLATFORM
+- Type:        string
+- Required:    false
 
 #### --quark-root-folder-id
 
-ID of the folder to use as the remote root.
+FID below which backup directories are created.
 
-Leave blank to use the account root.
+Leave blank to use the platform default directory. Set this to 0 only when
+backups should explicitly be written below the drive root.
 
 Properties:
 
@@ -148,29 +144,27 @@ Properties:
 - Type:        string
 - Required:    false
 
-#### --quark-list-page-size
+#### --quark-client-id
 
-Number of entries requested per directory-list page.
-
-Properties:
-
-- Config:      list_page_size
-- Env Var:     RCLONE_QUARK_LIST_PAGE_SIZE
-- Type:        int
-- Default:     50
-
-#### --quark-chunk-size
-
-Override the multipart upload chunk size.
-
-Leave at zero to use the size recommended by Quark Drive.
+Open-platform client ID.
 
 Properties:
 
-- Config:      chunk_size
-- Env Var:     RCLONE_QUARK_CHUNK_SIZE
-- Type:        SizeSuffix
-- Default:     0
+- Config:      client_id
+- Env Var:     RCLONE_QUARK_CLIENT_ID
+- Type:        string
+- Default:     "third_party_agent"
+
+#### --quark-sign-key
+
+Open-platform request signing key.
+
+Properties:
+
+- Config:      sign_key
+- Env Var:     RCLONE_QUARK_SIGN_KEY
+- Type:        string
+- Default:     "cf134812e2de4032bd1cb7c3727e84b3"
 
 #### --quark-encoding
 
@@ -198,13 +192,3 @@ Properties:
 
 <!-- autogenerated options stop -->
 <!-- markdownlint-restore -->
-
-## Notes
-
-Quark Drive may expire web sessions or require a new device confirmation. Run
-`rclone config reconnect remote:` to scan a new QR code when authentication
-fails.
-
-Public links are created without a password and do not expire when the command
-does not request a duration. `rclone link --unlink` removes links for the
-selected file or directory.
