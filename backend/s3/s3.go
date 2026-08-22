@@ -1279,8 +1279,7 @@ func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
 	}
 	// https://github.com/aws/aws-sdk-go-v2/blob/main/CHANGELOG.md#error-handling
 	// If this is an awserr object, try and extract more useful information to determine if we should retry
-	var awsError smithy.APIError
-	if errors.As(err, &awsError) {
+	if awsError, ok := errors.AsType[smithy.APIError](err); ok {
 		// Simple case, check the original embedded error in case it's generically retryable
 		if fserrors.ShouldRetry(awsError) {
 			return true, err
@@ -1356,12 +1355,39 @@ func getClient(ctx context.Context, opt *Options) *http.Client {
 	}
 }
 
+// s3RedirectSecretHeaders are the request headers carrying origin-bound
+// secrets that must not be forwarded when a redirect crosses a host or
+// downgrades the scheme. Go strips Authorization on a hostname change but not
+// on a scheme downgrade, and has no knowledge that the SSE-C headers hold raw
+// encryption keys, so we strip them all ourselves.
+var s3RedirectSecretHeaders = []string{
+	"X-Amz-Security-Token",  // AWS STS session token
+	"X-Amz-S3session-Token", // S3 Express (directory bucket) session token
+	"Authorization",         // e.g. IBM IAM bearer token
+	"ibm-service-instance-id",
+	"X-Amz-Server-Side-Encryption-Customer-Algorithm",
+	"X-Amz-Server-Side-Encryption-Customer-Key",
+	"X-Amz-Server-Side-Encryption-Customer-Key-Md5",
+	"X-Amz-Copy-Source-Server-Side-Encryption-Customer-Algorithm",
+	"X-Amz-Copy-Source-Server-Side-Encryption-Customer-Key",
+	"X-Amz-Copy-Source-Server-Side-Encryption-Customer-Key-Md5",
+	"Referer", // may be a presigned request
+}
+
 func s3CheckRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= 10 {
 		return errors.New("stopped after 10 redirects")
 	}
+	// Never follow a redirect that downgrades the transport from HTTPS to
+	// HTTP. An S3 endpoint has no legitimate reason to do this, and replaying
+	// the request over plaintext would expose whatever credential it carries.
+	if via[len(via)-1].URL.Scheme == "https" && req.URL.Scheme == "http" {
+		return fmt.Errorf("refusing to follow insecure redirect from HTTPS to HTTP: %s", req.URL.Redacted())
+	}
 	if s3RedirectCrossesHost(req, via) {
-		req.Header.Del("X-Amz-Security-Token")
+		for _, header := range s3RedirectSecretHeaders {
+			req.Header.Del(header)
+		}
 	}
 	return nil
 }
@@ -1689,7 +1715,9 @@ func setEndpointValueForIDriveE2(m configmap.Mapper) (err error) {
 	if !ok || value == "" {
 		return
 	}
-	client := &http.Client{Timeout: time.Second * 3}
+	// Reuse the S3 redirect policy so this bootstrap call, which posts the
+	// access key ID, won't be redirected from HTTPS to plaintext HTTP.
+	client := &http.Client{Timeout: time.Second * 3, CheckRedirect: s3CheckRedirect}
 	// API to get user region endpoint against the Access Key details: https://www.idrive.com/e2/guides/get_region_endpoint
 	resp, err := client.Post("https://api.idrivee2.com/api/service/get_region_end_point",
 		"application/json",
@@ -2478,8 +2506,7 @@ func (f *Fs) list(ctx context.Context, opt listOpt, fn listFn) error {
 			listBucket.URLEncodeListings(urlEncodeListings)
 			resp, versionIDs, err = listBucket.List(ctx)
 			if err != nil && !urlEncodeListings {
-				var xmlErr *xml.SyntaxError
-				if errors.As(err, &xmlErr) {
+				if _, ok := errors.AsType[*xml.SyntaxError](err); ok {
 					// Retry the listing with URL encoding as there were characters that XML can't encode
 					urlEncodeListings = true
 					fs.Debugf(f, "Retrying listing because of characters which can't be XML encoded")
@@ -2916,8 +2943,7 @@ func (f *Fs) makeBucket(ctx context.Context, bucket string) error {
 		if err == nil {
 			fs.Infof(f, "Bucket %q created with ACL %q", bucket, f.opt.BucketACL)
 		}
-		var awsErr smithy.APIError
-		if errors.As(err, &awsErr) {
+		if awsErr, ok := errors.AsType[smithy.APIError](err); ok {
 			switch awsErr.ErrorCode() {
 			case "BucketAlreadyOwnedByYou":
 				err = nil
@@ -4386,8 +4412,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		resp, err = o.fs.c.GetObject(ctx, &req, s3.WithAPIOptions(APIOptions...))
 		return o.fs.shouldRetry(ctx, err)
 	})
-	var awsError smithy.APIError
-	if errors.As(err, &awsError) {
+	if awsError, ok := errors.AsType[smithy.APIError](err); ok {
 		if awsError.ErrorCode() == "InvalidObjectState" {
 			return nil, fmt.Errorf("Object in GLACIER, restore first: bucket=%q, key=%q", bucket, bucketPath)
 		}
