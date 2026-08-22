@@ -25,7 +25,10 @@ import (
 // chunkSize is the size of each chunk for upload (4MB as required by Baidu)
 const chunkSize = 4 * 1024 * 1024
 
-const emptyMD5 = "d41d8cd98f00b204e9800998ecf8427e"
+const (
+	emptyMD5             = "d41d8cd98f00b204e9800998ecf8427e"
+	uploadRTypeOverwrite = "3"
+)
 
 type offsetReadSeeker struct {
 	io.ReadSeeker
@@ -169,8 +172,9 @@ func (o *Object) uploadWithHashes(ctx context.Context, reader io.ReadSeeker, abs
 		return fmt.Errorf("create failed: %w", err)
 	}
 
-	// Refresh metadata
-	return o.refreshMetadata(ctx)
+	// The directory listing can briefly return the replaced object's metadata.
+	// The create response describes the object committed by this upload.
+	return nil
 }
 
 // calculateBlockHashes reads the entire file and calculates MD5 for each 4MB chunk
@@ -264,7 +268,7 @@ func (o *Object) precreate(ctx context.Context, absPath string, size int64, bloc
 		"isdir":      {"0"},
 		"autoinit":   {"1"},
 		"block_list": {string(blockListJSON)},
-		"rtype":      {"2"}, // overwrite if the path exists
+		"rtype":      {uploadRTypeOverwrite},
 	}
 
 	opts := rest.Opts{
@@ -406,7 +410,7 @@ func (o *Object) create(ctx context.Context, absPath string, size int64, uploadI
 		"isdir":      {"0"},
 		"uploadid":   {uploadID},
 		"block_list": {string(blockListJSON)},
-		"rtype":      {"2"}, // overwrite if the path exists
+		"rtype":      {uploadRTypeOverwrite},
 	}
 
 	opts := rest.Opts{

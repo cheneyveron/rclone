@@ -697,7 +697,12 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	dstDir := path.Dir(dstPath)
 	dstName := path.Base(dstPath)
 
-	err := f.fileManager(ctx, api.FileManagerOpMove, srcPath, dstDir, dstName)
+	op := api.FileManagerOpMove
+	if path.Dir(srcPath) == dstDir {
+		op = api.FileManagerOpRename
+		dstDir = ""
+	}
+	err := f.fileManager(ctx, op, srcPath, dstDir, dstName)
 	if err != nil {
 		return nil, err
 	}
@@ -724,7 +729,12 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	dstDir := path.Dir(dstPath)
 	dstName := path.Base(dstPath)
 
-	return f.fileManager(ctx, api.FileManagerOpMove, srcPath, dstDir, dstName)
+	op := api.FileManagerOpMove
+	if path.Dir(srcPath) == dstDir {
+		op = api.FileManagerOpRename
+		dstDir = ""
+	}
+	return f.fileManager(ctx, op, srcPath, dstDir, dstName)
 }
 
 // fileManager performs file management operations (copy, move, delete, rename)
@@ -747,8 +757,12 @@ func (f *Fs) fileManager(ctx context.Context, op api.FileManagerOp, srcPath, des
 		return err
 	}
 
+	async := "2"
+	if op == api.FileManagerOpMove || op == api.FileManagerOpRename {
+		async = "0"
+	}
 	form := url.Values{
-		"async":    {"2"}, // 0=sync, 1=adaptive, 2=async
+		"async":    {async},
 		"filelist": {string(fileListJSON)},
 		"ondup":    {"overwrite"},
 	}

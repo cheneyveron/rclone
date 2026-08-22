@@ -113,7 +113,7 @@ type PrecreateRequest struct {
 	IsDir     int    `json:"isdir"`
 	AutoInit  int    `json:"autoinit"`
 	BlockList string `json:"block_list"` // JSON array of MD5 hashes
-	RType     int    `json:"rtype"`      // 0=fail on conflict, 1=rename, 2=overwrite
+	RType     int    `json:"rtype"`      // 0=fail, 1=rename, 2=rename if block list differs, 3=overwrite
 }
 
 // PrecreateResponse is the response from precreate API
@@ -139,7 +139,7 @@ type CreateRequest struct {
 	IsDir     int    `json:"isdir"`
 	UploadID  string `json:"uploadid"`
 	BlockList string `json:"block_list"` // JSON array of MD5 hashes
-	RType     int    `json:"rtype"`      // 0=fail on conflict, 1=rename, 2=overwrite
+	RType     int    `json:"rtype"`      // 0=fail, 1=rename, 2=rename if block list differs, 3=overwrite
 }
 
 // CreateResponse is the response from create API

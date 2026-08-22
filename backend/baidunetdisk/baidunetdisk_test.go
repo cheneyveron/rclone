@@ -292,7 +292,17 @@ func TestRmdirRefusesNonEmptyDirectory(t *testing.T) {
 }
 
 func TestFileManagerChecksItemErrors(t *testing.T) {
+	var async string
 	f := newTestFs(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		form, err := url.ParseQuery(string(body))
+		if err != nil {
+			return nil, err
+		}
+		async = form.Get("async")
 		return jsonResponse(http.StatusOK, api.FileManagerResponse{
 			Info: []*api.FileOpInfo{{
 				Errno: api.ErrnoFileNotExist,
@@ -305,6 +315,9 @@ func TestFileManagerChecksItemErrors(t *testing.T) {
 	var apiErr *api.Error
 	if !errors.As(err, &apiErr) || apiErr.Errno != api.ErrnoFileNotExist {
 		t.Fatalf("fileManager() error = %v, want API error %d", err, api.ErrnoFileNotExist)
+	}
+	if async != "0" {
+		t.Fatalf("filemanager async = %q, want 0", async)
 	}
 }
 
@@ -328,6 +341,61 @@ func TestFileManagerRequestsOverwrite(t *testing.T) {
 	}
 	if ondup != "overwrite" {
 		t.Fatalf("filemanager ondup = %q, want overwrite", ondup)
+	}
+}
+
+func TestMoveWithinDirectoryUsesRename(t *testing.T) {
+	var operation string
+	var async string
+	var item api.FileManagerItem
+	f := newTestFs(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Query().Get("method") == "list" {
+			return jsonResponse(http.StatusOK, api.ListResponse{List: []*api.File{{
+				FsID:           2,
+				ServerFilename: "destination",
+				Path:           "/apps/rclone/destination",
+				Size:           1,
+			}}}), nil
+		}
+
+		operation = req.URL.Query().Get("opera")
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		form, err := url.ParseQuery(string(body))
+		if err != nil {
+			return nil, err
+		}
+		async = form.Get("async")
+		var items []api.FileManagerItem
+		if err = json.Unmarshal([]byte(form.Get("filelist")), &items); err != nil {
+			return nil, err
+		}
+		if len(items) != 1 {
+			t.Fatalf("filemanager item count = %d, want 1", len(items))
+		}
+		item = items[0]
+		return jsonResponse(http.StatusOK, api.FileManagerResponse{}), nil
+	}))
+
+	src := &Object{
+		fs:     f,
+		remote: "source",
+		path:   "/apps/rclone/source",
+		size:   1,
+	}
+	if _, err := f.Move(context.Background(), src, "destination"); err != nil {
+		t.Fatal(err)
+	}
+	if operation != string(api.FileManagerOpRename) {
+		t.Fatalf("filemanager operation = %q, want %q", operation, api.FileManagerOpRename)
+	}
+	if async != "0" {
+		t.Fatalf("filemanager async = %q, want 0", async)
+	}
+	if item.Path != src.path || item.Dest != "" || item.NewName != "destination" {
+		t.Fatalf("filemanager item = %#v, want rename of %q to destination", item, src.path)
 	}
 }
 
@@ -532,7 +600,7 @@ func TestPutStreamSpoolsUnknownSize(t *testing.T) {
 				if got := form.Get("size"); got != strconv.Itoa(len(payload)) {
 					t.Fatalf("precreate size = %q, want %d", got, len(payload))
 				}
-				if got := form.Get("rtype"); got != "2" {
+				if got := form.Get("rtype"); got != "3" {
 					return jsonResponse(http.StatusBadRequest, api.Error{Errno: 2}), nil
 				}
 				return jsonResponse(http.StatusOK, api.PrecreateResponse{
@@ -544,7 +612,7 @@ func TestPutStreamSpoolsUnknownSize(t *testing.T) {
 				if form.Get("isdir") == "1" {
 					return jsonResponse(http.StatusOK, api.CreateResponse{}), nil
 				}
-				if form.Get("rtype") != "2" {
+				if form.Get("rtype") != "3" {
 					return jsonResponse(http.StatusBadRequest, api.Error{Errno: 2}), nil
 				}
 				finalized = true
@@ -573,6 +641,63 @@ func TestPutStreamSpoolsUnknownSize(t *testing.T) {
 	}
 	if obj.Size() != int64(len(payload)) {
 		t.Fatalf("object size = %d, want %d", obj.Size(), len(payload))
+	}
+}
+
+func TestUploadKeepsCreateMetadataWhenDirectoryListingIsStale(t *testing.T) {
+	const payload = "new"
+	var listCalls int
+	f := newTestFs(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host == "d.pcs.baidu.com" {
+			return jsonResponse(http.StatusOK, api.SuperfileResponse{}), nil
+		}
+
+		switch req.URL.Query().Get("method") {
+		case "precreate":
+			return jsonResponse(http.StatusOK, api.PrecreateResponse{
+				UploadID:   "upload-id",
+				ReturnType: 1,
+				BlockList:  []int{0},
+			}), nil
+		case "create":
+			return jsonResponse(http.StatusOK, api.CreateResponse{
+				FsID:  2,
+				Path:  "/apps/rclone/file",
+				Size:  int64(len(payload)),
+				Mtime: api.Time(2),
+			}), nil
+		case "list":
+			listCalls++
+			return jsonResponse(http.StatusOK, api.ListResponse{List: []*api.File{{
+				FsID:           1,
+				ServerFilename: "file",
+				Path:           "/apps/rclone/file",
+				Size:           1,
+				ServerMtime:    api.Time(1),
+			}}}), nil
+		default:
+			t.Fatalf("unexpected Baidu method %q", req.URL.Query().Get("method"))
+			return nil, nil
+		}
+	}))
+	o := &Object{
+		fs:      f,
+		remote:  "file",
+		fsID:    1,
+		path:    "/apps/rclone/file",
+		size:    1,
+		modTime: time.Unix(1, 0),
+	}
+	hash := md5.Sum([]byte(payload))
+
+	if err := o.uploadWithHashes(context.Background(), bytes.NewReader([]byte(payload)), o.fs.absPath(o.remote), int64(len(payload)), []string{hex.EncodeToString(hash[:])}); err != nil {
+		t.Fatal(err)
+	}
+	if listCalls != 0 {
+		t.Fatalf("directory list calls after create = %d, want 0", listCalls)
+	}
+	if o.fsID != 2 || o.size != int64(len(payload)) || !o.modTime.Equal(time.Unix(2, 0)) {
+		t.Fatalf("object metadata = {fsID:%d size:%d modTime:%v}, want create response metadata", o.fsID, o.size, o.modTime)
 	}
 }
 
