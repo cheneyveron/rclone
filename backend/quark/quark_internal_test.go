@@ -12,6 +12,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -48,6 +50,10 @@ func newTestFs(t *testing.T, server *httptest.Server) (*Fs, configmap.Simple) {
 		apiURL:       server.URL,
 		accessToken:  "access",
 		refreshToken: "refresh",
+		statePath:    filepath.Join(t.TempDir(), "state.json"),
+		stateScope:   "test-scope",
+		state:        backupState{Version: stateVersion, Scope: "test-scope", Objects: make(map[string]stateObject)},
+		historyRun:   "test-run",
 	}
 	f.features = (&fs.Features{CanHaveEmptyDirectories: true, ReadMimeType: true}).Fill(ctx, f)
 	f.dirCache = dircache.New("", "", f)
@@ -88,10 +94,11 @@ func TestNewFsAllowsMissingRefreshToken(t *testing.T) {
 		"device_id":    "device",
 		"client_id":    "client",
 		"sign_key":     "sign-key",
+		"state_file":   filepath.Join(t.TempDir(), "state.json"),
 	}
 	f, err := NewFs(context.Background(), "test", "", config)
 	require.NoError(t, err)
-	assert.Equal(t, "Quark Drive upload-only root \"\"", f.String())
+	assert.Equal(t, "Quark Drive backup root \"\"", f.String())
 }
 
 func TestUnsupportedOpenPlatformOperations(t *testing.T) {
@@ -110,6 +117,98 @@ func TestUnsupportedOpenPlatformOperations(t *testing.T) {
 	assert.ErrorIs(t, err, fs.ErrorNotImplemented)
 	err = obj.Remove(context.Background())
 	assert.ErrorIs(t, err, fs.ErrorNotImplemented)
+}
+
+func TestReplacementRecoversPendingMovesWithoutReupload(t *testing.T) {
+	const remote = "sub/file.txt"
+	var moveFIDs []string
+	var uploadParent string
+	var uploadCalls int
+	oldMoveAttempts := 0
+	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		checkSignedRequest(t, request, "sign-key")
+		switch request.URL.Path {
+		case "/open/v1/dir":
+			var body map[string]string
+			require.NoError(t, json.NewDecoder(request.Body).Decode(&body))
+			fid := body["pdir_fid"] + "/" + body["dir_path"]
+			writeJSON(t, writer, map[string]any{"status": 0, "data": map[string]any{"fid": fid}})
+		case "/open/v1/file/upload_pre":
+			uploadCalls++
+			var body uploadPreRequest
+			require.NoError(t, json.NewDecoder(request.Body).Decode(&body))
+			uploadParent = body.ParentID
+			writeJSON(t, writer, map[string]any{"status": 0, "data": map[string]any{"finish": true, "fid": "new-fid"}})
+		case "/open/v1/file/move":
+			var body struct {
+				FIDs     []string `json:"fid_list"`
+				TargetID string   `json:"to_pdir_fid"`
+				Action   int      `json:"action_type"`
+			}
+			require.NoError(t, json.NewDecoder(request.Body).Decode(&body))
+			require.Len(t, body.FIDs, 1)
+			assert.Equal(t, 1, body.Action)
+			moveFIDs = append(moveFIDs, body.FIDs[0])
+			if body.FIDs[0] == "old-fid" {
+				assert.Contains(t, body.TargetID, versionDir)
+				oldMoveAttempts++
+				if oldMoveAttempts == 1 {
+					writeJSON(t, writer, map[string]any{"status": 1, "errno": 42, "error_info": "temporary failure"})
+					return
+				}
+				writeJSON(t, writer, map[string]any{"status": 0, "data": map[string]any{"finish": false, "task_id": "move-task"}})
+				return
+			}
+			assert.Equal(t, "new-fid", body.FIDs[0])
+			assert.Equal(t, "final-parent", body.TargetID)
+			writeJSON(t, writer, map[string]any{"status": 0, "data": map[string]any{"finish": true}})
+		case "/open/v1/file/query_task":
+			assert.Equal(t, "move-task", request.URL.Query().Get("task_id"))
+			writeJSON(t, writer, map[string]any{"status": 0, "data": map[string]any{"status": 2}})
+		default:
+			http.NotFound(writer, request)
+		}
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	f, _ := newTestFs(t, server)
+	old := stateObject{FID: "old-fid", ParentID: "final-parent", Size: 3, ModTime: time.Unix(1, 0).UnixMilli(), MimeType: "text/plain"}
+	require.NoError(t, f.storeStateObject(remote, old))
+
+	dstObject, err := f.NewObject(context.Background(), remote)
+	require.NoError(t, err)
+	src := object.NewStaticObjectInfo(remote, time.Unix(2, 0), 3, true, nil, f)
+	err = dstObject.Update(context.Background(), strings.NewReader("new"), src)
+	require.ErrorContains(t, err, "temporary failure")
+	assert.Contains(t, uploadParent, stagingDir)
+	assert.Equal(t, 1, uploadCalls)
+
+	restarted, _ := newTestFs(t, server)
+	restarted.statePath = f.statePath
+	restarted.stateScope = f.stateScope
+	require.NoError(t, restarted.loadState())
+	dstObject, err = restarted.NewObject(context.Background(), remote)
+	require.NoError(t, err)
+	assert.Equal(t, "new-fid", dstObject.(fs.IDer).ID())
+	assert.Equal(t, int64(3), dstObject.Size())
+	assert.Equal(t, []string{"old-fid", "old-fid", "new-fid"}, moveFIDs)
+	assert.Equal(t, 1, uploadCalls)
+
+	data, err := os.ReadFile(f.statePath)
+	require.NoError(t, err)
+	var persisted backupState
+	require.NoError(t, json.Unmarshal(data, &persisted))
+	assert.Empty(t, persisted.Objects[remote].Pending)
+	assert.Empty(t, persisted.Objects[remote].PlaceIn)
+
+	reloaded, _ := newTestFs(t, server)
+	reloaded.statePath = f.statePath
+	reloaded.stateScope = f.stateScope
+	require.NoError(t, reloaded.loadState())
+	dstObject, err = reloaded.NewObject(context.Background(), remote)
+	require.NoError(t, err)
+	assert.Equal(t, "new-fid", dstObject.(fs.IDer).ID())
+	assert.Equal(t, 1, uploadCalls)
 }
 
 func TestPutUsesOpenPlatformFormUploadFlow(t *testing.T) {

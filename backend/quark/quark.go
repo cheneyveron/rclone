@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,6 +47,11 @@ const (
 	defaultDeviceID = "wild_claw"
 	defaultPartSize = int64(10 * fs.Mebi)
 	formUploadLimit = int64(10 * fs.Mebi)
+	stateVersion    = 1
+	versionDir      = ".rclone-versions"
+	stagingDir      = ".rclone-staging"
+	movePolls       = 60
+	movePollDelay   = time.Second
 )
 
 var retryErrorCodes = []int{
@@ -69,6 +75,7 @@ type Options struct {
 	RootFolderID string               `config:"root_folder_id"`
 	ClientID     string               `config:"client_id"`
 	SignKey      string               `config:"sign_key"`
+	StateFile    string               `config:"state_file"`
 	Enc          encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -87,9 +94,14 @@ type Fs struct {
 	refreshMu    sync.Mutex
 	accessToken  string
 	refreshToken string
+	statePath    string
+	stateScope   string
+	stateMu      sync.Mutex
+	state        backupState
+	historyRun   string
 }
 
-// Object describes a file uploaded during the current rclone process.
+// Object describes a file tracked by the persistent backup state.
 type Object struct {
 	fs       *Fs
 	remote   string
@@ -98,6 +110,27 @@ type Object struct {
 	size     int64
 	modTime  time.Time
 	mimeType string
+}
+
+type pendingArchive struct {
+	FID      string `json:"fid"`
+	TargetID string `json:"target_id"`
+}
+
+type stateObject struct {
+	FID      string           `json:"fid"`
+	ParentID string           `json:"parent_id"`
+	Size     int64            `json:"size"`
+	ModTime  int64            `json:"mod_time"`
+	MimeType string           `json:"mime_type,omitempty"`
+	Pending  []pendingArchive `json:"pending_archives,omitempty"`
+	PlaceIn  string           `json:"place_in,omitempty"`
+}
+
+type backupState struct {
+	Version int                    `json:"version"`
+	Scope   string                 `json:"scope"`
+	Objects map[string]stateObject `json:"objects"`
 }
 
 type proofFields struct {
@@ -202,6 +235,16 @@ backups should explicitly be written below the drive root.`,
 			Advanced:  true,
 			Sensitive: true,
 		}, {
+			Name: "state_file",
+			Help: `Path to the persistent backup state file.
+
+The state file maps remote paths to Quark Drive FIDs so that copy
+--no-traverse can detect unchanged files and replace changed files without
+directory listing support. Keep this file on persistent storage and do not
+share it between different remotes. The default is inside rclone's cache
+directory.`,
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -254,10 +297,131 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		apiURL:       defaultAPIURL,
 		accessToken:  accessToken,
 		refreshToken: refreshToken,
+		historyRun:   time.Now().UTC().Format("20060102T150405.000000000Z") + "-" + random.String(8),
+	}
+	f.stateScope = backupStateScope(root, opt)
+	f.statePath = opt.StateFile
+	if f.statePath == "" {
+		stateName := sha256.Sum256([]byte(name + "\x00" + f.stateScope))
+		f.statePath = filepath.Join(config.GetCacheDir(), "quark", hex.EncodeToString(stateName[:16])+".json")
+	}
+	if err = f.loadState(); err != nil {
+		return nil, err
 	}
 	f.features = (&fs.Features{CanHaveEmptyDirectories: true, ReadMimeType: true}).Fill(ctx, f)
 	f.dirCache = dircache.New(root, opt.RootFolderID, f)
 	return f, nil
+}
+
+func backupStateScope(root string, opt *Options) string {
+	sum := sha256.Sum256([]byte(opt.UserID + "\x00" + opt.RootFolderID + "\x00" + root))
+	return hex.EncodeToString(sum[:])
+}
+
+func (f *Fs) loadState() error {
+	f.state = backupState{Version: stateVersion, Scope: f.stateScope, Objects: make(map[string]stateObject)}
+	data, err := os.ReadFile(f.statePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to read Quark Drive state file %q: %w", f.statePath, err)
+	}
+	var state backupState
+	if err = json.Unmarshal(data, &state); err != nil {
+		return fmt.Errorf("failed to decode Quark Drive state file %q: %w", f.statePath, err)
+	}
+	if state.Version != stateVersion {
+		return fmt.Errorf("unsupported Quark Drive state version %d in %q", state.Version, f.statePath)
+	}
+	if state.Scope != f.stateScope {
+		return fmt.Errorf("Quark Drive state file %q belongs to a different user or remote root", f.statePath)
+	}
+	if state.Objects == nil {
+		state.Objects = make(map[string]stateObject)
+	}
+	for remote, object := range state.Objects {
+		normalized, normalizeErr := normalizeRemote(remote)
+		if normalizeErr != nil || normalized != remote || object.FID == "" {
+			return fmt.Errorf("invalid object %q in Quark Drive state file %q", remote, f.statePath)
+		}
+		for _, pending := range object.Pending {
+			if pending.FID == "" || pending.TargetID == "" {
+				return fmt.Errorf("invalid pending replacement for %q in Quark Drive state file %q", remote, f.statePath)
+			}
+		}
+	}
+	f.state = state
+	return nil
+}
+
+func (f *Fs) saveStateLocked() error {
+	data, err := json.MarshalIndent(&f.state, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	dir := filepath.Dir(f.statePath)
+	if err = os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("failed to create Quark Drive state directory %q: %w", dir, err)
+	}
+	temp, err := os.CreateTemp(dir, ".quark-state-*")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer func() { _ = os.Remove(tempName) }()
+	if err = temp.Chmod(0600); err == nil {
+		_, err = temp.Write(data)
+	}
+	if err == nil {
+		err = temp.Sync()
+	}
+	if closeErr := temp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return fmt.Errorf("failed to write Quark Drive state file %q: %w", f.statePath, err)
+	}
+	if err = os.Rename(tempName, f.statePath); err != nil {
+		return fmt.Errorf("failed to replace Quark Drive state file %q: %w", f.statePath, err)
+	}
+	return nil
+}
+
+func normalizeRemote(remote string) (string, error) {
+	remote = strings.Trim(remote, "/")
+	if remote == "" || remote == "." || path.Clean(remote) != remote {
+		return "", fmt.Errorf("invalid Quark Drive object path %q", remote)
+	}
+	for _, reserved := range []string{versionDir, stagingDir} {
+		if remote == reserved || strings.HasPrefix(remote, reserved+"/") {
+			return "", fmt.Errorf("Quark Drive object path %q uses reserved directory %q", remote, reserved)
+		}
+	}
+	return remote, nil
+}
+
+func objectFromState(f *Fs, remote string, entry stateObject) *Object {
+	return &Object{
+		fs:       f,
+		remote:   remote,
+		id:       entry.FID,
+		parentID: entry.ParentID,
+		size:     entry.Size,
+		modTime:  time.UnixMilli(entry.ModTime),
+		mimeType: entry.MimeType,
+	}
+}
+
+func stateFromObject(object *Object) stateObject {
+	return stateObject{
+		FID:      object.id,
+		ParentID: object.parentID,
+		Size:     object.size,
+		ModTime:  object.modTime.UnixMilli(),
+		MimeType: object.mimeType,
+	}
 }
 
 // Name returns the configured remote name.
@@ -267,7 +431,7 @@ func (f *Fs) Name() string { return f.name }
 func (f *Fs) Root() string { return f.root }
 
 // String returns a description of the remote.
-func (f *Fs) String() string { return fmt.Sprintf("Quark Drive upload-only root %q", f.root) }
+func (f *Fs) String() string { return fmt.Sprintf("Quark Drive backup root %q", f.root) }
 
 // Precision returns the timestamp precision accepted for new uploads.
 func (f *Fs) Precision() time.Duration { return time.Millisecond }
@@ -280,12 +444,25 @@ func (f *Fs) Features() *fs.Features { return f.features }
 
 // List reports the open-platform directory-listing limitation.
 func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
-	return nil, fmt.Errorf("Quark Drive open platform cannot list directories; use copy --no-traverse with a unique destination: %w", fs.ErrorNotImplemented)
+	return nil, fmt.Errorf("Quark Drive open platform cannot list directories; use copy --no-traverse: %w", fs.ErrorNotImplemented)
 }
 
-// NewObject reports objects as absent because the open platform cannot resolve paths.
+// NewObject resolves an object from the persistent backup state.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	return nil, fs.ErrorObjectNotFound
+	remote, err := normalizeRemote(remote)
+	if err != nil {
+		return nil, err
+	}
+	if err = f.settleObject(ctx, remote); err != nil {
+		return nil, err
+	}
+	f.stateMu.Lock()
+	entry, ok := f.state.Objects[remote]
+	f.stateMu.Unlock()
+	if !ok {
+		return nil, fs.ErrorObjectNotFound
+	}
+	return objectFromState(f, remote, entry), nil
 }
 
 // FindLeaf reports a cache miss; CreateDir is idempotent and resolves it when writing.
@@ -320,6 +497,167 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	return fmt.Errorf("Quark Drive open platform cannot remove directories: %w", fs.ErrorNotImplemented)
 }
 
+func (f *Fs) moveFile(ctx context.Context, fid, targetID string) error {
+	request := map[string]any{"fid_list": []string{fid}, "to_pdir_fid": targetID, "action_type": 1}
+	var response api.MoveResponse
+	if err := f.callJSON(ctx, http.MethodPost, "/open/v1/file/move", request, &response); err != nil {
+		return err
+	}
+	if response.Data.Finish {
+		return nil
+	}
+	if response.Data.TaskID == "" {
+		return errors.New("quark drive move returned neither completion nor a task ID")
+	}
+	for attempt := 0; attempt < movePolls; attempt++ {
+		var task api.QueryTaskResponse
+		query := url.Values{"task_id": []string{response.Data.TaskID}}
+		if err := f.callJSONQuery(ctx, http.MethodGet, "/open/v1/file/query_task", query, nil, &task); err != nil {
+			return err
+		}
+		switch task.Data.Status {
+		case 2:
+			return nil
+		case 3:
+			return fmt.Errorf("quark drive move task %q failed", response.Data.TaskID)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(movePollDelay):
+		}
+	}
+	return fmt.Errorf("quark drive move task %q timed out", response.Data.TaskID)
+}
+
+func cloneStateObject(entry stateObject) stateObject {
+	entry.Pending = append([]pendingArchive(nil), entry.Pending...)
+	return entry
+}
+
+func (f *Fs) storeStateObject(remote string, entry stateObject) error {
+	f.stateMu.Lock()
+	defer f.stateMu.Unlock()
+	previous, existed := f.state.Objects[remote]
+	f.state.Objects[remote] = cloneStateObject(entry)
+	if err := f.saveStateLocked(); err != nil {
+		if existed {
+			f.state.Objects[remote] = previous
+		} else {
+			delete(f.state.Objects, remote)
+		}
+		return err
+	}
+	return nil
+}
+
+func (f *Fs) settleObject(ctx context.Context, remote string) error {
+	for {
+		f.stateMu.Lock()
+		entry, ok := f.state.Objects[remote]
+		if ok {
+			entry = cloneStateObject(entry)
+		}
+		f.stateMu.Unlock()
+		if !ok {
+			return nil
+		}
+
+		var fid, targetID string
+		archive := false
+		if len(entry.Pending) != 0 {
+			fid = entry.Pending[0].FID
+			targetID = entry.Pending[0].TargetID
+			archive = true
+		} else if entry.PlaceIn != "" {
+			fid = entry.FID
+			targetID = entry.PlaceIn
+		} else {
+			return nil
+		}
+		if err := f.moveFile(ctx, fid, targetID); err != nil {
+			return fmt.Errorf("failed to complete replacement for %q: %w", remote, err)
+		}
+
+		f.stateMu.Lock()
+		current, exists := f.state.Objects[remote]
+		if !exists {
+			f.stateMu.Unlock()
+			return nil
+		}
+		previous := cloneStateObject(current)
+		updated := false
+		if archive && len(current.Pending) != 0 && current.Pending[0] == entry.Pending[0] {
+			current.Pending = current.Pending[1:]
+			updated = true
+		} else if !archive && current.FID == entry.FID && current.PlaceIn == entry.PlaceIn {
+			current.PlaceIn = ""
+			updated = true
+		}
+		if !updated {
+			f.stateMu.Unlock()
+			continue
+		}
+		f.state.Objects[remote] = current
+		err := f.saveStateLocked()
+		if err != nil {
+			f.state.Objects[remote] = previous
+		}
+		f.stateMu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (f *Fs) replacementDirs(ctx context.Context, remote string) (stagingID, archiveID string, err error) {
+	directory := path.Dir(remote)
+	if directory == "." {
+		directory = ""
+	}
+	stagingPath := path.Join(stagingDir, f.historyRun, directory)
+	archivePath := path.Join(versionDir, f.historyRun, directory)
+	if stagingID, err = f.dirCache.FindDir(ctx, stagingPath, true); err != nil {
+		return "", "", err
+	}
+	if archiveID, err = f.dirCache.FindDir(ctx, archivePath, true); err != nil {
+		return "", "", err
+	}
+	return stagingID, archiveID, nil
+}
+
+func (f *Fs) replaceObject(ctx context.Context, old stateObject, in io.Reader, src fs.ObjectInfo) (*Object, error) {
+	remote, err := normalizeRemote(src.Remote())
+	if err != nil {
+		return nil, err
+	}
+	if old.ParentID == "" {
+		return nil, errors.New("replacing a file in the platform default directory requires root_folder_id or a non-empty remote path")
+	}
+	stagingID, archiveID, err := f.replacementDirs(ctx, remote)
+	if err != nil {
+		return nil, err
+	}
+	newObject, err := f.upload(ctx, in, src, path.Base(remote), stagingID)
+	if err != nil {
+		return nil, err
+	}
+	newObject.remote = remote
+	newObject.parentID = old.ParentID
+	entry := stateFromObject(newObject)
+	if newObject.id != old.FID {
+		entry.Pending = append(entry.Pending, pendingArchive{FID: old.FID, TargetID: archiveID})
+		entry.PlaceIn = old.ParentID
+	}
+	if err = f.storeStateObject(remote, entry); err != nil {
+		return newObject, err
+	}
+	if err = f.settleObject(ctx, remote); err != nil {
+		return newObject, err
+	}
+	return newObject, nil
+}
+
 func (f *Fs) token() (accessToken, refreshToken string) {
 	f.tokenMu.RLock()
 	defer f.tokenMu.RUnlock()
@@ -352,7 +690,7 @@ func (f *Fs) signedHeaders(method, requestPath string) http.Header {
 	return header
 }
 
-func (f *Fs) requestURL(requestPath, accessToken string) (string, error) {
+func (f *Fs) requestURL(requestPath, accessToken string, values url.Values) (string, error) {
 	u, err := url.Parse(f.apiURL + requestPath)
 	if err != nil {
 		return "", err
@@ -366,6 +704,11 @@ func (f *Fs) requestURL(requestPath, accessToken string) (string, error) {
 	if f.opt.Platform != "" {
 		query.Set("platform", f.opt.Platform)
 	}
+	for key, entries := range values {
+		for _, value := range entries {
+			query.Add(key, value)
+		}
+	}
 	u.RawQuery = query.Encode()
 	return u.String(), nil
 }
@@ -377,10 +720,18 @@ func fixedRequest(in any) requestPreparer {
 }
 
 func (f *Fs) callJSON(ctx context.Context, method, requestPath string, in, out any) error {
-	return f.callJSONPrepared(ctx, method, requestPath, fixedRequest(in), out)
+	return f.callJSONQuery(ctx, method, requestPath, nil, in, out)
+}
+
+func (f *Fs) callJSONQuery(ctx context.Context, method, requestPath string, query url.Values, in, out any) error {
+	return f.callJSONPreparedQuery(ctx, method, requestPath, query, fixedRequest(in), out)
 }
 
 func (f *Fs) callJSONPrepared(ctx context.Context, method, requestPath string, prepare requestPreparer, out any) error {
+	return f.callJSONPreparedQuery(ctx, method, requestPath, nil, prepare, out)
+}
+
+func (f *Fs) callJSONPreparedQuery(ctx context.Context, method, requestPath string, query url.Values, prepare requestPreparer, out any) error {
 	for authAttempt := 0; authAttempt < 2; authAttempt++ {
 		accessToken, refreshToken := f.token()
 		headers := f.signedHeaders(method, requestPath)
@@ -392,7 +743,7 @@ func (f *Fs) callJSONPrepared(ctx context.Context, method, requestPath string, p
 		if err != nil {
 			return err
 		}
-		rawURL, err := f.requestURL(requestPath, accessToken)
+		rawURL, err := f.requestURL(requestPath, accessToken, query)
 		if err != nil {
 			return err
 		}
@@ -804,13 +1155,34 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, leaf, 
 	return &Object{fs: f, remote: src.Remote(), id: id, parentID: parentID, size: size, modTime: modTime, mimeType: mimeType}, nil
 }
 
-// Put uploads a new object without probing the destination.
+// Put uploads a new object or replaces one tracked in the backup state.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	leaf, parentID, err := f.dirCache.FindPath(ctx, src.Remote(), true)
+	remote, err := normalizeRemote(src.Remote())
 	if err != nil {
 		return nil, err
 	}
-	return f.upload(ctx, in, src, leaf, parentID)
+	if err = f.settleObject(ctx, remote); err != nil {
+		return nil, err
+	}
+	f.stateMu.Lock()
+	old, exists := f.state.Objects[remote]
+	f.stateMu.Unlock()
+	if exists {
+		return f.replaceObject(ctx, old, in, src)
+	}
+	leaf, parentID, err := f.dirCache.FindPath(ctx, remote, true)
+	if err != nil {
+		return nil, err
+	}
+	object, err := f.upload(ctx, in, src, leaf, parentID)
+	if err != nil {
+		return nil, err
+	}
+	object.remote = remote
+	if err = f.storeStateObject(remote, stateFromObject(object)); err != nil {
+		return object, err
+	}
+	return object, nil
 }
 
 // PutStream uploads an object whose size is not known in advance.
@@ -865,14 +1237,14 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	return nil, fmt.Errorf("Quark Drive open-platform backup backend does not implement reads: %w", fs.ErrorNotImplemented)
 }
 
-// Update writes another upload to the same logical path.
+// Update uploads a replacement and archives the previous FID.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	newObject, err := o.fs.upload(ctx, in, src, path.Base(o.remote), o.parentID)
-	if err != nil {
-		return err
+	old := stateFromObject(o)
+	newObject, err := o.fs.replaceObject(ctx, old, in, src)
+	if newObject != nil {
+		*o = *newObject
 	}
-	*o = *newObject
-	return nil
+	return err
 }
 
 // Remove reports the open-platform deletion limitation.

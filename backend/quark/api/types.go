@@ -94,6 +94,23 @@ type UploadFinishResponse struct {
 	} `json:"data"`
 }
 
+// MoveResponse describes a file move operation.
+type MoveResponse struct {
+	Response
+	Data struct {
+		Finish bool   `json:"finish"`
+		TaskID string `json:"task_id"`
+	} `json:"data"`
+}
+
+// QueryTaskResponse describes the state of an asynchronous file operation.
+type QueryTaskResponse struct {
+	Response
+	Data struct {
+		Status int `json:"status"`
+	} `json:"data"`
+}
+
 // RotateTokenResponse contains refreshed long-lived credentials.
 type RotateTokenResponse struct {
 	Response
