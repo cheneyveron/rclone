@@ -23,7 +23,9 @@ package pikpak
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,6 +72,8 @@ const (
 	defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0"
 	minSleep         = 100 * time.Millisecond
 	maxSleep         = 2 * time.Second
+	backupMinSleep   = 500 * time.Millisecond
+	backupMaxSleep   = 30 * time.Second
 	taskWaitTime     = 500 * time.Millisecond
 	decayConstant    = 2 // bigger for slower decay, exponential
 	rootURL          = "https://api-drive.mypikpak.com"
@@ -222,6 +226,18 @@ Fill in for rclone to use a non root folder as its starting point.
 			Help:     "Use original file links instead of media links.\n\nThis avoids issues caused by invalid media links, but may reduce download speeds.",
 			Advanced: true,
 		}, {
+			Name:    "backup_mode",
+			Default: false,
+			Help: `Enable local-to-PikPak backup behavior.
+
+This mode compares same-sized files by MD5, calculates the MD5 locally when
+PikPak does not provide one, replaces changed files, permanently removes the
+replaced object, serializes uploads, and uses exponential retry backoff.
+
+Run the backup command with --transfers 1 --checkers 1 as well if all remote
+operations must be serialized.`,
+			Advanced: true,
+		}, {
 			Name:     "hash_memory_limit",
 			Help:     "Files bigger than this will be cached on disk to calculate hash if required.",
 			Default:  fs.SizeSuffix(10 * 1024 * 1024),
@@ -307,6 +323,7 @@ type Options struct {
 	ChunkSize           fs.SizeSuffix        `config:"chunk_size"`
 	UploadCutoff        fs.SizeSuffix        `config:"upload_cutoff"`
 	UploadConcurrency   int                  `config:"upload_concurrency"`
+	BackupMode          bool                 `config:"backup_mode"`
 	Enc                 encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -323,6 +340,7 @@ type Fs struct {
 	client       *http.Client       // authorized client
 	m            configmap.Mapper
 	tokenMu      *sync.Mutex // when renewing tokens
+	backupMu     sync.Mutex  // serializes backup uploads
 }
 
 // Object describes a pikpak object
@@ -365,6 +383,9 @@ func (f *Fs) Features() *fs.Features {
 
 // Precision return the precision of this Fs
 func (f *Fs) Precision() time.Duration {
+	if f.opt.BackupMode {
+		return time.Nanosecond
+	}
 	return fs.ModTimeNotSupported
 	// meaning that the modification times from the backend shouldn't be used for syncing
 	// as they can't be set.
@@ -536,7 +557,11 @@ func (f *Fs) newClientWithPacer(ctx context.Context) (err error) {
 		}
 	}
 	f.rst = newPikpakClient(f.client, &f.opt).SetCaptchaTokener(ctx, f.m)
-	f.pacer = fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
+	minPacerSleep, maxPacerSleep := minSleep, maxSleep
+	if f.opt.BackupMode {
+		minPacerSleep, maxPacerSleep = backupMinSleep, backupMaxSleep
+	}
+	f.pacer = fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minPacerSleep), pacer.MaxSleep(maxPacerSleep), pacer.DecayConstant(decayConstant)))
 	return nil
 }
 
@@ -592,6 +617,7 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 	if err != nil {
 		return nil, fmt.Errorf("pikpak: upload cutoff: %w", err)
 	}
+	applyBackupOptions(opt)
 
 	root := parsePath(path)
 
@@ -624,6 +650,15 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 	}
 
 	return f, nil
+}
+
+func applyBackupOptions(opt *Options) {
+	if !opt.BackupMode {
+		return
+	}
+	opt.UseTrash = false
+	opt.UploadConcurrency = 1
+	opt.UploadCutoff = 0
 }
 
 // NewFs constructs an Fs from the path, container:path
@@ -1866,7 +1901,26 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	if t != hash.MD5 {
 		return "", hash.ErrUnsupported
 	}
-	return strings.ToLower(o.md5sum), nil
+	if o.md5sum != "" || !o.fs.opt.BackupMode {
+		return strings.ToLower(o.md5sum), nil
+	}
+
+	// Some PikPak objects have no server-side MD5. Calculate it from the
+	// object so backup mode can distinguish changed files with equal sizes.
+	rc, err := o.Open(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to open object for MD5: %w", err)
+	}
+	digest := md5.New()
+	_, copyErr := io.Copy(digest, rc)
+	closeErr := rc.Close()
+	if copyErr != nil {
+		return "", fmt.Errorf("failed to calculate object MD5: %w", copyErr)
+	}
+	if closeErr != nil {
+		return "", fmt.Errorf("failed to close object after MD5: %w", closeErr)
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
 // Size returns the size of an object in bytes
@@ -1896,6 +1950,9 @@ func (o *Object) ParentID() string {
 
 // ModTime returns the modification time of the object
 func (o *Object) ModTime(ctx context.Context) time.Time {
+	if o.fs.opt.BackupMode {
+		return time.Unix(0, 0)
+	}
 	err := o.readMetaData(ctx)
 	if err != nil {
 		fs.Logf(o, "Failed to read metadata: %v", err)
@@ -1906,6 +1963,9 @@ func (o *Object) ModTime(ctx context.Context) time.Time {
 
 // SetModTime sets the modification time of the local fs object
 func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
+	if o.fs.opt.BackupMode {
+		return nil
+	}
 	return fs.ErrorCantSetModTime
 }
 
@@ -1980,6 +2040,11 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 // upload uploads the object with or without using a temporary file name
 func (o *Object) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, withTemp bool, options ...fs.OpenOption) (err error) {
+	if o.fs.opt.BackupMode {
+		o.fs.backupMu.Lock()
+		defer o.fs.backupMu.Unlock()
+	}
+
 	size := src.Size()
 	remote := o.Remote()
 
