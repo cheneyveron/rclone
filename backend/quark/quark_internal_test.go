@@ -22,6 +22,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
@@ -529,6 +530,25 @@ func TestExpiredTokenIsRotatedAndPersisted(t *testing.T) {
 	assert.Equal(t, "new-access", accessToken)
 	assert.Equal(t, "new-refresh", refreshToken)
 	assert.Equal(t, 2, rotateCalls)
+}
+
+func TestExpiredTokenRefreshFailureIsFatal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/open/v1/dir":
+			writeJSON(t, writer, map[string]any{"status": 1, "errno": 11001, "error_info": "expired"})
+		case "/agent/v1/oauth/access_token/rotate":
+			http.Error(writer, "temporary failure", http.StatusServiceUnavailable)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	f, _ := newTestFs(t, server)
+
+	_, err := f.CreateDir(context.Background(), "", "snapshot")
+	require.Error(t, err)
+	assert.True(t, fserrors.IsFatalError(err))
 }
 
 func TestSpoolInputRejectsChangedSourceSize(t *testing.T) {

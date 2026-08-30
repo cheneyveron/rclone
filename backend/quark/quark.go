@@ -874,7 +874,7 @@ func (f *Fs) callJSONPreparedQuery(ctx context.Context, method, requestPath stri
 		}
 		if common.Errno == 11001 && authAttempt == 0 && refreshToken != "" {
 			if err = f.refreshAccessToken(ctx, accessToken); err != nil {
-				return err
+				return fserrors.FatalError(err)
 			}
 			continue
 		}
