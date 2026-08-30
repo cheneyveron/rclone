@@ -10,7 +10,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -20,6 +22,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fstest/fstests"
 	"github.com/rclone/rclone/lib/encoder"
@@ -204,6 +207,127 @@ func TestNewObjectRejectsPathTraversal(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Fatalf("path traversal made %d HTTP requests, want 0", calls)
+	}
+}
+
+func TestTrackedNewObjectPersistsWithoutRemoteLookup(t *testing.T) {
+	var calls int
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return jsonResponse(http.StatusInternalServerError, api.Error{Errno: 1}), nil
+	})
+	statePath := filepath.Join(t.TempDir(), "state.jsonl")
+	f := newTestFs(t, transport)
+	f.statePath = statePath
+	f.stateScope = "test-scope"
+	f.state = backupState{Version: stateVersion, Scope: f.stateScope, Objects: make(map[string]stateObject)}
+	wantModTime := time.Unix(123, 456_000_000)
+	record := stateObject{
+		FsID:    42,
+		Size:    7,
+		ModTime: wantModTime.UnixNano(),
+		MD5:     "7d793037a0760186574b0282f2f435e7",
+		Path:    "/apps/rclone/sub/file.txt",
+	}
+	if err := f.storeStateObject("sub/file.txt", record); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := newTestFs(t, transport)
+	restarted.statePath = statePath
+	restarted.stateScope = f.stateScope
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	obj, err := restarted.NewObject(context.Background(), "sub/file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obj.Size() != record.Size || !obj.ModTime(context.Background()).Equal(wantModTime) {
+		t.Fatalf("tracked object metadata = {size:%d modTime:%v}, want {size:%d modTime:%v}", obj.Size(), obj.ModTime(context.Background()), record.Size, wantModTime)
+	}
+	if got, err := obj.Hash(context.Background(), hash.MD5); err != nil || got != record.MD5 {
+		t.Fatalf("tracked object MD5 = %q, %v; want %q", got, err, record.MD5)
+	}
+	if _, err = restarted.NewObject(context.Background(), "missing.txt"); !errors.Is(err, fs.ErrorObjectNotFound) {
+		t.Fatalf("missing tracked object error = %v, want %v", err, fs.ErrorObjectNotFound)
+	}
+	if calls != 0 {
+		t.Fatalf("tracked NewObject made %d HTTP calls, want 0", calls)
+	}
+}
+
+func TestTrackedStateRejectsWrongScope(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.jsonl")
+	f := newTestFs(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusOK, api.ListResponse{}), nil
+	}))
+	f.statePath = statePath
+	f.stateScope = "first-scope"
+	f.state = backupState{Version: stateVersion, Scope: f.stateScope, Objects: make(map[string]stateObject)}
+	if err := f.storeStateObject("file.txt", stateObject{FsID: 1, Path: "/apps/rclone/file.txt"}); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := newTestFs(t, http.DefaultTransport)
+	restarted.statePath = statePath
+	restarted.stateScope = "different-scope"
+	if err := restarted.loadState(); err == nil || !strings.Contains(err.Error(), "different remote root") {
+		t.Fatalf("loadState() error = %v, want scope mismatch", err)
+	}
+}
+
+func TestTrackedStateRecoversTruncatedTail(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.jsonl")
+	f := newTestFs(t, http.DefaultTransport)
+	f.statePath = statePath
+	f.stateScope = "test-scope"
+	f.state = backupState{Version: stateVersion, Scope: f.stateScope, Objects: make(map[string]stateObject)}
+	if err := f.storeStateObject("file.txt", stateObject{FsID: 1, Path: "/apps/rclone/file.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(statePath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = file.WriteString(`{"remote":"partial`); err != nil {
+		t.Fatal(err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := newTestFs(t, http.DefaultTransport)
+	restarted.statePath = statePath
+	restarted.stateScope = f.stateScope
+	if err = restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = restarted.NewObject(context.Background(), "file.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err = restarted.storeStateObject("next.txt", stateObject{FsID: 2, Path: "/apps/rclone/next.txt"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTrackedFailedUploadIsNotPersisted(t *testing.T) {
+	f := newTestFs(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusOK, api.CreateResponse{Errno: -7}), nil
+	}))
+	f.statePath = filepath.Join(t.TempDir(), "state.jsonl")
+	f.stateScope = "test-scope"
+	f.state = backupState{Version: stateVersion, Scope: f.stateScope, Objects: make(map[string]stateObject)}
+	src := object.NewStaticObjectInfo("invalid.txt", time.Unix(123, 0), 1, true, nil, f)
+
+	if _, err := f.Put(context.Background(), strings.NewReader("x"), src); err == nil {
+		t.Fatal("Put() succeeded, want upload failure")
+	}
+	if len(f.state.Objects) != 0 {
+		t.Fatalf("failed upload persisted %d state objects, want 0", len(f.state.Objects))
+	}
+	if _, err := os.Stat(f.statePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("state file error = %v, want not exist", err)
 	}
 }
 
@@ -752,7 +876,11 @@ func TestEmptyUploadUsesMultipartFlow(t *testing.T) {
 			return jsonResponse(http.StatusBadRequest, api.Error{Errno: 2}), nil
 		}
 	}))
-	src := object.NewStaticObjectInfo("empty.bin", time.Now(), 0, true, nil, f)
+	f.statePath = filepath.Join(t.TempDir(), "state.jsonl")
+	f.stateScope = "test-scope"
+	f.state = backupState{Version: stateVersion, Scope: f.stateScope, Objects: make(map[string]stateObject)}
+	modTime := time.Unix(123, 456_000_000)
+	src := object.NewStaticObjectInfo("empty.bin", modTime, 0, true, nil, f)
 
 	obj, err := f.Put(context.Background(), strings.NewReader(""), src)
 	if err != nil {
@@ -763,6 +891,13 @@ func TestEmptyUploadUsesMultipartFlow(t *testing.T) {
 	}
 	if obj.Size() != 0 {
 		t.Fatalf("object size = %d, want 0", obj.Size())
+	}
+	tracked, ok := f.state.Objects["empty.bin"]
+	if !ok {
+		t.Fatal("successful upload was not persisted in the backup state")
+	}
+	if tracked.FsID != 43 || tracked.Size != 0 || tracked.Path != "/apps/rclone/empty.bin" || tracked.ModTime != modTime.UnixNano() {
+		t.Fatalf("tracked metadata = %+v, want uploaded object with source modtime %v", tracked, modTime)
 	}
 }
 

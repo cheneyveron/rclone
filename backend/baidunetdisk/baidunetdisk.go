@@ -2,16 +2,22 @@
 package baidunetdisk
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rclone/rclone/backend/baidunetdisk/api"
@@ -38,6 +44,7 @@ const (
 	rootURL        = "https://pan.baidu.com"
 	uploadRootURL  = "https://d.pcs.baidu.com"
 	defaultAppName = "bdpan" // App folder name in /apps/
+	stateVersion   = 1
 
 	// Baidu's download CDN requires this value in the User-Agent.
 	baiduUserAgent = "pan.baidu.com"
@@ -116,6 +123,16 @@ func init() {
 			Help:     "App name in /apps/ folder.\n\nBaidu Netdisk stores files under /apps/{app_name}/ path.",
 			Advanced: true,
 		}, {
+			Name: "state_file",
+			Help: `Path to a persistent local backup state file.
+
+When set, the state file maps remote paths to metadata recorded after
+successful uploads. This lets copy --no-traverse skip unchanged files without
+querying Baidu Netdisk for every source file. The state is authoritative, so
+changes made outside rclone are not detected. Do not share a state file between
+different remotes or roots. Leave blank to query Baidu normally.`,
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -129,20 +146,25 @@ type Options struct {
 	ClientID     string               `config:"client_id"`
 	ClientSecret string               `config:"client_secret"`
 	AppName      string               `config:"app_name"`
+	StateFile    string               `config:"state_file"`
 	Enc          encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote Baidu Netdisk.
 type Fs struct {
-	name     string       // name of this remote
-	root     string       // the path we are working on (relative to /apps/{app_name}/)
-	appRoot  string       // /apps/{app_name}
-	opt      Options      // parsed options
-	features *fs.Features // optional features
-	srv      *rest.Client // the connection to the server
-	pacer    *fs.Pacer    // pacer for API calls
-	client   *http.Client // authorized http client
-	ts       *oauthutil.TokenSource
+	name       string       // name of this remote
+	root       string       // the path we are working on (relative to /apps/{app_name}/)
+	appRoot    string       // /apps/{app_name}
+	opt        Options      // parsed options
+	features   *fs.Features // optional features
+	srv        *rest.Client // the connection to the server
+	pacer      *fs.Pacer    // pacer for API calls
+	client     *http.Client // authorized http client
+	ts         *oauthutil.TokenSource
+	statePath  string
+	stateScope string
+	stateMu    sync.Mutex
+	state      backupState
 }
 
 // Object describes a Baidu Netdisk object.
@@ -154,6 +176,31 @@ type Object struct {
 	fsID    int64     // file system ID
 	md5     string    // MD5 hash
 	path    string    // full path on Baidu Netdisk
+}
+
+type stateObject struct {
+	FsID    int64  `json:"fs_id"`
+	Size    int64  `json:"size"`
+	ModTime int64  `json:"mod_time"`
+	MD5     string `json:"md5,omitempty"`
+	Path    string `json:"path"`
+}
+
+type backupState struct {
+	Version int
+	Scope   string
+	Objects map[string]stateObject
+}
+
+type stateHeader struct {
+	Version int    `json:"version"`
+	Scope   string `json:"scope"`
+}
+
+type stateRecord struct {
+	Remote  string       `json:"remote"`
+	Object  *stateObject `json:"object,omitempty"`
+	Deleted bool         `json:"deleted,omitempty"`
 }
 
 // ------------------------------------------------------------
@@ -180,6 +227,9 @@ func (f *Fs) Features() *fs.Features {
 
 // Precision returns the supported modification time precision.
 func (f *Fs) Precision() time.Duration {
+	if f.statePath != "" {
+		return time.Nanosecond
+	}
 	return fs.ModTimeNotSupported
 }
 
@@ -220,6 +270,193 @@ func (f *Fs) absPath(remote string) string {
 		return f.appRoot
 	}
 	return f.appRoot + "/" + relative
+}
+
+func backupStateScope(name, root string, opt *Options) string {
+	sum := sha256.Sum256([]byte(name + "\x00" + opt.AppName + "\x00" + root))
+	return hex.EncodeToString(sum[:])
+}
+
+func objectFromState(f *Fs, remote string, entry stateObject) *Object {
+	return &Object{
+		fs:      f,
+		remote:  remote,
+		size:    entry.Size,
+		modTime: time.Unix(0, entry.ModTime),
+		fsID:    entry.FsID,
+		md5:     entry.MD5,
+		path:    entry.Path,
+	}
+}
+
+func stateFromObject(object *Object) stateObject {
+	return stateObject{
+		FsID:    object.fsID,
+		Size:    object.size,
+		ModTime: object.modTime.UnixNano(),
+		MD5:     object.md5,
+		Path:    object.path,
+	}
+}
+
+func validStateObject(entry stateObject) bool {
+	return entry.FsID > 0 && entry.Size >= 0 && entry.Path != ""
+}
+
+func (f *Fs) loadState() error {
+	f.state = backupState{Version: stateVersion, Scope: f.stateScope, Objects: make(map[string]stateObject)}
+	data, err := os.ReadFile(f.statePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to read Baidu Netdisk state file %q: %w", f.statePath, err)
+	}
+	lastNewline := bytes.LastIndexByte(data, '\n')
+	if lastNewline < 0 {
+		return fmt.Errorf("failed to decode Baidu Netdisk state file %q: missing header", f.statePath)
+	}
+	if lastNewline != len(data)-1 {
+		if err = os.Truncate(f.statePath, int64(lastNewline+1)); err != nil {
+			return fmt.Errorf("failed to recover Baidu Netdisk state file %q: %w", f.statePath, err)
+		}
+		data = data[:lastNewline+1]
+	}
+	lines := bytes.Split(data[:len(data)-1], []byte{'\n'})
+	var header stateHeader
+	if len(lines) == 0 || json.Unmarshal(lines[0], &header) != nil {
+		return fmt.Errorf("failed to decode Baidu Netdisk state file %q header", f.statePath)
+	}
+	if header.Version != stateVersion {
+		return fmt.Errorf("unsupported Baidu Netdisk state version %d in %q", header.Version, f.statePath)
+	}
+	if header.Scope != f.stateScope {
+		return fmt.Errorf("Baidu Netdisk state file %q belongs to a different remote root", f.statePath)
+	}
+	for lineNumber, line := range lines[1:] {
+		if len(line) == 0 {
+			continue
+		}
+		var record stateRecord
+		if err = json.Unmarshal(line, &record); err != nil {
+			return fmt.Errorf("failed to decode Baidu Netdisk state file %q line %d: %w", f.statePath, lineNumber+2, err)
+		}
+		if err = validatePath(record.Remote); err != nil || record.Remote == "" || path.Clean(record.Remote) != record.Remote {
+			return fmt.Errorf("invalid object %q in Baidu Netdisk state file %q", record.Remote, f.statePath)
+		}
+		if record.Deleted {
+			delete(f.state.Objects, record.Remote)
+			continue
+		}
+		if record.Object == nil || !validStateObject(*record.Object) {
+			return fmt.Errorf("invalid metadata for object %q in Baidu Netdisk state file %q", record.Remote, f.statePath)
+		}
+		f.state.Objects[record.Remote] = *record.Object
+	}
+	return nil
+}
+
+func (f *Fs) createStateFileLocked() error {
+	dir := filepath.Dir(f.statePath)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("failed to create Baidu Netdisk state directory %q: %w", dir, err)
+	}
+	header, err := json.Marshal(stateHeader{Version: stateVersion, Scope: f.stateScope})
+	if err != nil {
+		return err
+	}
+	header = append(header, '\n')
+	temp, err := os.CreateTemp(dir, ".baidunetdisk-state-*")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer func() { _ = os.Remove(tempName) }()
+	if err = temp.Chmod(0600); err == nil {
+		_, err = temp.Write(header)
+	}
+	if err == nil {
+		err = temp.Sync()
+	}
+	if closeErr := temp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return fmt.Errorf("failed to write Baidu Netdisk state file %q: %w", f.statePath, err)
+	}
+	if err = os.Rename(tempName, f.statePath); err != nil {
+		return fmt.Errorf("failed to replace Baidu Netdisk state file %q: %w", f.statePath, err)
+	}
+	return nil
+}
+
+func (f *Fs) appendStateRecordLocked(record stateRecord) error {
+	if _, err := os.Stat(f.statePath); errors.Is(err, os.ErrNotExist) {
+		if err = f.createStateFileLocked(); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return fmt.Errorf("failed to access Baidu Netdisk state file %q: %w", f.statePath, err)
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	file, err := os.OpenFile(f.statePath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err = file.Write(data); err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return fmt.Errorf("failed to append Baidu Netdisk state file %q: %w", f.statePath, err)
+	}
+	return nil
+}
+
+func (f *Fs) storeStateObject(remote string, entry stateObject) error {
+	if f.statePath == "" {
+		return nil
+	}
+	if err := validatePath(remote); err != nil {
+		return err
+	}
+	if remote == "" || path.Clean(remote) != remote || !validStateObject(entry) {
+		return fmt.Errorf("invalid tracked Baidu Netdisk object %q", remote)
+	}
+	f.stateMu.Lock()
+	defer f.stateMu.Unlock()
+	if err := f.appendStateRecordLocked(stateRecord{Remote: remote, Object: &entry}); err != nil {
+		return err
+	}
+	f.state.Objects[remote] = entry
+	return nil
+}
+
+func (f *Fs) removeStateObject(remote string) error {
+	if f.statePath == "" {
+		return nil
+	}
+	f.stateMu.Lock()
+	defer f.stateMu.Unlock()
+	if err := f.appendStateRecordLocked(stateRecord{Remote: remote, Deleted: true}); err != nil {
+		return err
+	}
+	delete(f.state.Objects, remote)
+	return nil
+}
+
+func (f *Fs) trackUploadedObject(ctx context.Context, object *Object, src fs.ObjectInfo) error {
+	if f.statePath == "" {
+		return nil
+	}
+	object.modTime = src.ModTime(ctx)
+	return f.storeStateObject(object.remote, stateFromObject(object))
 }
 
 // errorHandler parses a non 2xx error response into an error
@@ -338,6 +575,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Create REST client
 	f.srv = rest.NewClient(f.client).SetRoot(rootURL).SetErrorHandler(errorHandler)
 
+	rootIsFile := false
 	// Check if root exists and is a file
 	if f.root != "" {
 		absRoot := f.absPath("")
@@ -346,17 +584,30 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			if !errors.Is(err, fs.ErrorObjectNotFound) {
 				return nil, fmt.Errorf("failed to read root %q: %w", f.root, err)
 			}
-			return f, nil
-		}
-		if info.IsDir == 0 {
+		} else if info.IsDir == 0 {
 			// Root is a file - set root to parent directory
 			newRoot := path.Dir(f.root)
 			if newRoot == "." {
 				newRoot = ""
 			}
 			f.root = newRoot
-			return f, fs.ErrorIsFile
+			rootIsFile = true
 		}
+	}
+	if opt.StateFile != "" {
+		f.statePath = opt.StateFile
+		f.stateScope = backupStateScope(name, f.root, opt)
+		if err = f.loadState(); err != nil {
+			return nil, err
+		}
+		// Stateful mode must route mutations through Put, Update, and Remove so
+		// every successful change is recorded in the local state.
+		f.features.Copy = nil
+		f.features.Move = nil
+		f.features.DirMove = nil
+	}
+	if rootIsFile {
+		return f, fs.ErrorIsFile
 	}
 
 	return f, nil
@@ -510,6 +761,15 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	if err := validatePath(remote); err != nil {
 		return nil, err
 	}
+	if f.statePath != "" {
+		f.stateMu.Lock()
+		entry, ok := f.state.Objects[remote]
+		f.stateMu.Unlock()
+		if !ok {
+			return nil, fs.ErrorObjectNotFound
+		}
+		return objectFromState(f, remote, entry), nil
+	}
 	absPath := f.absPath(remote)
 	info, err := f.getFileInfo(ctx, absPath)
 	if err != nil {
@@ -546,6 +806,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	err := o.upload(ctx, in, size, options...)
 	if err != nil {
 		return nil, err
+	}
+	if err = f.trackUploadedObject(ctx, o, src); err != nil {
+		return o, err
 	}
 
 	return o, nil
@@ -979,12 +1242,18 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 // Update updates the object with new content.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	return o.upload(ctx, in, src.Size(), options...)
+	if err := o.upload(ctx, in, src.Size(), options...); err != nil {
+		return err
+	}
+	return o.fs.trackUploadedObject(ctx, o, src)
 }
 
 // Remove removes the object.
 func (o *Object) Remove(ctx context.Context) error {
-	return o.fs.delete(ctx, o.path)
+	if err := o.fs.delete(ctx, o.path); err != nil {
+		return err
+	}
+	return o.fs.removeStateObject(o.remote)
 }
 
 // Check the interfaces are satisfied
