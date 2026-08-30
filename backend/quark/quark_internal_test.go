@@ -119,6 +119,75 @@ func TestUnsupportedOpenPlatformOperations(t *testing.T) {
 	assert.ErrorIs(t, err, fs.ErrorNotImplemented)
 }
 
+func TestStateFileAppendsRecordsWithoutRewriting(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	f, _ := newTestFs(t, server)
+	first := stateObject{FID: "first-fid", ParentID: "parent", Size: 1, ModTime: 1}
+	require.NoError(t, f.storeStateObject("first.txt", first))
+	firstData, err := os.ReadFile(f.statePath)
+	require.NoError(t, err)
+
+	second := stateObject{FID: "second-fid", ParentID: "parent", Size: 2, ModTime: 2}
+	require.NoError(t, f.storeStateObject("second.txt", second))
+	secondData, err := os.ReadFile(f.statePath)
+	require.NoError(t, err)
+	assert.Greater(t, len(secondData), len(firstData))
+	assert.True(t, bytes.HasPrefix(secondData, firstData), "second state update rewrote existing records")
+
+	reloaded, _ := newTestFs(t, server)
+	reloaded.statePath = f.statePath
+	reloaded.stateScope = f.stateScope
+	require.NoError(t, reloaded.loadState())
+	assert.Equal(t, first.FID, reloaded.state.Objects["first.txt"].FID)
+	assert.Equal(t, second.FID, reloaded.state.Objects["second.txt"].FID)
+}
+
+func TestLoadStateMigratesLegacyJSON(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	f, _ := newTestFs(t, server)
+	legacy := backupState{
+		Version: stateVersion,
+		Scope:   f.stateScope,
+		Objects: map[string]stateObject{
+			"legacy.txt": {FID: "legacy-fid", ParentID: "parent", Size: 3, ModTime: 3},
+		},
+	}
+	data, err := json.MarshalIndent(&legacy, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(f.statePath, append(data, '\n'), 0600))
+
+	require.NoError(t, f.loadState())
+	assert.Equal(t, "legacy-fid", f.state.Objects["legacy.txt"].FID)
+	migrated, err := os.ReadFile(f.statePath)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, bytes.Count(migrated, []byte{'\n'}), 2)
+	var header stateHeader
+	require.NoError(t, json.Unmarshal(bytes.SplitN(migrated, []byte{'\n'}, 2)[0], &header))
+	assert.Equal(t, stateVersion, header.Version)
+	assert.Equal(t, f.stateScope, header.Scope)
+}
+
+func TestStateFileRecoversTruncatedTail(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	f, _ := newTestFs(t, server)
+	require.NoError(t, f.storeStateObject("first.txt", stateObject{FID: "first-fid", ParentID: "parent"}))
+	file, err := os.OpenFile(f.statePath, os.O_APPEND|os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = file.WriteString(`{"remote":"partial`)
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	reloaded, _ := newTestFs(t, server)
+	reloaded.statePath = f.statePath
+	reloaded.stateScope = f.stateScope
+	require.NoError(t, reloaded.loadState())
+	require.NoError(t, reloaded.storeStateObject("second.txt", stateObject{FID: "second-fid", ParentID: "parent"}))
+	assert.Len(t, reloaded.state.Objects, 2)
+}
+
 func TestReplacementRecoversPendingMovesWithoutReupload(t *testing.T) {
 	const remote = "sub/file.txt"
 	var moveFIDs []string
@@ -194,17 +263,12 @@ func TestReplacementRecoversPendingMovesWithoutReupload(t *testing.T) {
 	assert.Equal(t, []string{"old-fid", "old-fid", "new-fid"}, moveFIDs)
 	assert.Equal(t, 1, uploadCalls)
 
-	data, err := os.ReadFile(f.statePath)
-	require.NoError(t, err)
-	var persisted backupState
-	require.NoError(t, json.Unmarshal(data, &persisted))
-	assert.Empty(t, persisted.Objects[remote].Pending)
-	assert.Empty(t, persisted.Objects[remote].PlaceIn)
-
 	reloaded, _ := newTestFs(t, server)
 	reloaded.statePath = f.statePath
 	reloaded.stateScope = f.stateScope
 	require.NoError(t, reloaded.loadState())
+	assert.Empty(t, reloaded.state.Objects[remote].Pending)
+	assert.Empty(t, reloaded.state.Objects[remote].PlaceIn)
 	dstObject, err = reloaded.NewObject(context.Background(), remote)
 	require.NoError(t, err)
 	assert.Equal(t, "new-fid", dstObject.(fs.IDer).ID())

@@ -257,6 +257,41 @@ func TestTrackedNewObjectPersistsWithoutRemoteLookup(t *testing.T) {
 	}
 }
 
+func TestTrackedStateAppendsRecordsWithoutRewriting(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.jsonl")
+	f := newTestFs(t, http.DefaultTransport)
+	f.statePath = statePath
+	f.stateScope = "test-scope"
+	f.state = backupState{Version: stateVersion, Scope: f.stateScope, Objects: make(map[string]stateObject)}
+	if err := f.storeStateObject("first.txt", stateObject{FsID: 1, Path: "/apps/rclone/first.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	firstData, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = f.storeStateObject("second.txt", stateObject{FsID: 2, Path: "/apps/rclone/second.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	secondData, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secondData) <= len(firstData) || !bytes.HasPrefix(secondData, firstData) {
+		t.Fatal("second state update rewrote existing records")
+	}
+
+	restarted := newTestFs(t, http.DefaultTransport)
+	restarted.statePath = statePath
+	restarted.stateScope = f.stateScope
+	if err = restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if len(restarted.state.Objects) != 2 {
+		t.Fatalf("loaded %d state objects, want 2", len(restarted.state.Objects))
+	}
+}
+
 func TestTrackedStateRejectsWrongScope(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.jsonl")
 	f := newTestFs(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {

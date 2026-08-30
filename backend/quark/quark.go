@@ -20,6 +20,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -131,6 +132,16 @@ type backupState struct {
 	Version int                    `json:"version"`
 	Scope   string                 `json:"scope"`
 	Objects map[string]stateObject `json:"objects"`
+}
+
+type stateHeader struct {
+	Version int    `json:"version"`
+	Scope   string `json:"scope"`
+}
+
+type stateRecord struct {
+	Remote string      `json:"remote"`
+	Object stateObject `json:"object"`
 }
 
 type proofFields struct {
@@ -327,42 +338,89 @@ func (f *Fs) loadState() error {
 	if err != nil {
 		return fmt.Errorf("failed to read Quark Drive state file %q: %w", f.statePath, err)
 	}
-	var state backupState
-	if err = json.Unmarshal(data, &state); err != nil {
-		return fmt.Errorf("failed to decode Quark Drive state file %q: %w", f.statePath, err)
-	}
-	if state.Version != stateVersion {
-		return fmt.Errorf("unsupported Quark Drive state version %d in %q", state.Version, f.statePath)
-	}
-	if state.Scope != f.stateScope {
-		return fmt.Errorf("Quark Drive state file %q belongs to a different user or remote root", f.statePath)
-	}
-	if state.Objects == nil {
-		state.Objects = make(map[string]stateObject)
-	}
-	for remote, object := range state.Objects {
-		normalized, normalizeErr := normalizeRemote(remote)
-		if normalizeErr != nil || normalized != remote || object.FID == "" {
-			return fmt.Errorf("invalid object %q in Quark Drive state file %q", remote, f.statePath)
+
+	// State files created before the append-only format are migrated once.
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(data, &fields) == nil && fields["objects"] != nil {
+		var legacy backupState
+		if err = json.Unmarshal(data, &legacy); err != nil {
+			return fmt.Errorf("failed to decode Quark Drive state file %q: %w", f.statePath, err)
 		}
-		for _, pending := range object.Pending {
-			if pending.FID == "" || pending.TargetID == "" {
-				return fmt.Errorf("invalid pending replacement for %q in Quark Drive state file %q", remote, f.statePath)
-			}
+		if err = f.validateState(legacy.Version, legacy.Scope, legacy.Objects); err != nil {
+			return err
 		}
+		if legacy.Objects == nil {
+			legacy.Objects = make(map[string]stateObject)
+		}
+		f.state = legacy
+		return f.writeStateSnapshotLocked()
 	}
-	f.state = state
+
+	lastNewline := bytes.LastIndexByte(data, '\n')
+	if lastNewline < 0 {
+		return fmt.Errorf("failed to decode Quark Drive state file %q: missing header", f.statePath)
+	}
+	if lastNewline != len(data)-1 {
+		if err = os.Truncate(f.statePath, int64(lastNewline+1)); err != nil {
+			return fmt.Errorf("failed to recover Quark Drive state file %q: %w", f.statePath, err)
+		}
+		data = data[:lastNewline+1]
+	}
+	lines := bytes.Split(data[:len(data)-1], []byte{'\n'})
+	var header stateHeader
+	if len(lines) == 0 || json.Unmarshal(lines[0], &header) != nil {
+		return fmt.Errorf("failed to decode Quark Drive state file %q header", f.statePath)
+	}
+	if err = f.validateState(header.Version, header.Scope, nil); err != nil {
+		return err
+	}
+	for lineNumber, line := range lines[1:] {
+		if len(line) == 0 {
+			continue
+		}
+		var record stateRecord
+		if err = json.Unmarshal(line, &record); err != nil {
+			return fmt.Errorf("failed to decode Quark Drive state file %q line %d: %w", f.statePath, lineNumber+2, err)
+		}
+		if err = f.validateStateObject(record.Remote, record.Object); err != nil {
+			return err
+		}
+		f.state.Objects[record.Remote] = record.Object
+	}
 	return nil
 }
 
-func (f *Fs) saveStateLocked() error {
-	data, err := json.MarshalIndent(&f.state, "", "  ")
-	if err != nil {
-		return err
+func (f *Fs) validateState(version int, scope string, objects map[string]stateObject) error {
+	if version != stateVersion {
+		return fmt.Errorf("unsupported Quark Drive state version %d in %q", version, f.statePath)
 	}
-	data = append(data, '\n')
+	if scope != f.stateScope {
+		return fmt.Errorf("Quark Drive state file %q belongs to a different user or remote root", f.statePath)
+	}
+	for remote, object := range objects {
+		if err := f.validateStateObject(remote, object); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *Fs) validateStateObject(remote string, object stateObject) error {
+	normalized, err := normalizeRemote(remote)
+	if err != nil || normalized != remote || object.FID == "" {
+		return fmt.Errorf("invalid object %q in Quark Drive state file %q", remote, f.statePath)
+	}
+	for _, pending := range object.Pending {
+		if pending.FID == "" || pending.TargetID == "" {
+			return fmt.Errorf("invalid pending replacement for %q in Quark Drive state file %q", remote, f.statePath)
+		}
+	}
+	return nil
+}
+
+func (f *Fs) writeStateSnapshotLocked() error {
 	dir := filepath.Dir(f.statePath)
-	if err = os.MkdirAll(dir, 0700); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("failed to create Quark Drive state directory %q: %w", dir, err)
 	}
 	temp, err := os.CreateTemp(dir, ".quark-state-*")
@@ -372,7 +430,19 @@ func (f *Fs) saveStateLocked() error {
 	tempName := temp.Name()
 	defer func() { _ = os.Remove(tempName) }()
 	if err = temp.Chmod(0600); err == nil {
-		_, err = temp.Write(data)
+		encoder := json.NewEncoder(temp)
+		err = encoder.Encode(stateHeader{Version: stateVersion, Scope: f.stateScope})
+		remotes := make([]string, 0, len(f.state.Objects))
+		for remote := range f.state.Objects {
+			remotes = append(remotes, remote)
+		}
+		sort.Strings(remotes)
+		for _, remote := range remotes {
+			if err != nil {
+				break
+			}
+			err = encoder.Encode(stateRecord{Remote: remote, Object: f.state.Objects[remote]})
+		}
 	}
 	if err == nil {
 		err = temp.Sync()
@@ -385,6 +455,35 @@ func (f *Fs) saveStateLocked() error {
 	}
 	if err = os.Rename(tempName, f.statePath); err != nil {
 		return fmt.Errorf("failed to replace Quark Drive state file %q: %w", f.statePath, err)
+	}
+	return nil
+}
+
+func (f *Fs) appendStateObjectLocked(remote string, object stateObject) error {
+	if _, err := os.Stat(f.statePath); errors.Is(err, os.ErrNotExist) {
+		if err = f.writeStateSnapshotLocked(); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return fmt.Errorf("failed to access Quark Drive state file %q: %w", f.statePath, err)
+	}
+	data, err := json.Marshal(stateRecord{Remote: remote, Object: object})
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	file, err := os.OpenFile(f.statePath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err = file.Write(data); err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return fmt.Errorf("failed to append Quark Drive state file %q: %w", f.statePath, err)
 	}
 	return nil
 }
@@ -536,18 +635,16 @@ func cloneStateObject(entry stateObject) stateObject {
 }
 
 func (f *Fs) storeStateObject(remote string, entry stateObject) error {
-	f.stateMu.Lock()
-	defer f.stateMu.Unlock()
-	previous, existed := f.state.Objects[remote]
-	f.state.Objects[remote] = cloneStateObject(entry)
-	if err := f.saveStateLocked(); err != nil {
-		if existed {
-			f.state.Objects[remote] = previous
-		} else {
-			delete(f.state.Objects, remote)
-		}
+	if err := f.validateStateObject(remote, entry); err != nil {
 		return err
 	}
+	f.stateMu.Lock()
+	defer f.stateMu.Unlock()
+	entry = cloneStateObject(entry)
+	if err := f.appendStateObjectLocked(remote, entry); err != nil {
+		return err
+	}
+	f.state.Objects[remote] = entry
 	return nil
 }
 
@@ -585,7 +682,6 @@ func (f *Fs) settleObject(ctx context.Context, remote string) error {
 			f.stateMu.Unlock()
 			return nil
 		}
-		previous := cloneStateObject(current)
 		updated := false
 		if archive && len(current.Pending) != 0 && current.Pending[0] == entry.Pending[0] {
 			current.Pending = current.Pending[1:]
@@ -598,10 +694,9 @@ func (f *Fs) settleObject(ctx context.Context, remote string) error {
 			f.stateMu.Unlock()
 			continue
 		}
-		f.state.Objects[remote] = current
-		err := f.saveStateLocked()
-		if err != nil {
-			f.state.Objects[remote] = previous
+		err := f.appendStateObjectLocked(remote, current)
+		if err == nil {
+			f.state.Objects[remote] = current
 		}
 		f.stateMu.Unlock()
 		if err != nil {
