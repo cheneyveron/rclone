@@ -483,6 +483,7 @@ func TestOpenPlatformMultipartUploadFlow(t *testing.T) {
 func TestExpiredTokenIsRotatedAndPersisted(t *testing.T) {
 	var server *httptest.Server
 	directoryCalls := 0
+	rotateCalls := 0
 	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/open/v1/dir":
@@ -496,6 +497,11 @@ func TestExpiredTokenIsRotatedAndPersisted(t *testing.T) {
 			}
 			writeJSON(t, writer, map[string]any{"status": 0, "data": map[string]any{"fid": "directory-fid"}})
 		case "/agent/v1/oauth/access_token/rotate":
+			rotateCalls++
+			if rotateCalls == 1 {
+				http.Error(writer, "temporary failure", http.StatusServiceUnavailable)
+				return
+			}
 			var body map[string]string
 			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 				t.Errorf("failed to decode refresh request: %v", err)
@@ -522,6 +528,7 @@ func TestExpiredTokenIsRotatedAndPersisted(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "new-access", accessToken)
 	assert.Equal(t, "new-refresh", refreshToken)
+	assert.Equal(t, 2, rotateCalls)
 }
 
 func TestSpoolInputRejectsChangedSourceSize(t *testing.T) {

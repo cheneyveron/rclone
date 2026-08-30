@@ -905,33 +905,54 @@ func (f *Fs) refreshAccessToken(ctx context.Context, staleAccessToken string) er
 		return errors.New("quark drive access token expired and no refresh_token is configured")
 	}
 	requestPath := "/agent/v1/oauth/access_token/rotate"
-	headers := f.signedHeaders(http.MethodPost, requestPath)
 	payload, err := json.Marshal(map[string]string{"refresh_token": refreshToken, "device_id": f.opt.DeviceID})
 	if err != nil {
 		return err
 	}
-	u, err := url.Parse(f.apiURL + requestPath)
+	var responseBody []byte
+	var responseStatus string
+	var responseStatusCode int
+	err = f.pacer.Call(func() (bool, error) {
+		u, requestErr := url.Parse(f.apiURL + requestPath)
+		if requestErr != nil {
+			return false, requestErr
+		}
+		query := u.Query()
+		query.Set("req_id", random.String(32))
+		u.RawQuery = query.Encode()
+		req, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
+		if requestErr != nil {
+			return false, requestErr
+		}
+		req.Header = f.signedHeaders(http.MethodPost, requestPath)
+		resp, requestErr := f.client.Do(req)
+		if requestErr != nil {
+			return fserrors.ShouldRetry(requestErr), requestErr
+		}
+		defer resp.Body.Close()
+		responseStatus = resp.Status
+		responseStatusCode = resp.StatusCode
+		responseBody, requestErr = io.ReadAll(io.LimitReader(resp.Body, int64(fs.Mebi)))
+		if requestErr != nil {
+			return true, requestErr
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			retry := fserrors.ShouldRetryHTTP(resp, retryErrorCodes)
+			if retry {
+				requestErr = fmt.Errorf("failed to refresh Quark Drive token: HTTP %s", resp.Status)
+			}
+			return retry, requestErr
+		}
+		return false, nil
+	})
 	if err != nil {
 		return err
 	}
-	query := u.Query()
-	query.Set("req_id", random.String(32))
-	u.RawQuery = query.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	req.Header = headers
-	resp, err := f.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("failed to refresh Quark Drive token: HTTP %s", resp.Status)
+	if responseStatusCode < 200 || responseStatusCode >= 300 {
+		return fmt.Errorf("failed to refresh Quark Drive token: HTTP %s", responseStatus)
 	}
 	var response api.RotateTokenResponse
-	if err = json.NewDecoder(io.LimitReader(resp.Body, int64(fs.Mebi))).Decode(&response); err != nil {
+	if err = json.Unmarshal(responseBody, &response); err != nil {
 		return err
 	}
 	if err = response.Response.Check(); err != nil {
