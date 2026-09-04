@@ -39,7 +39,7 @@ const (
 	bdpanXOREncodedClientSecret = "\xaa\xed\x04\x6c\xd3\x98\x4d\x28\xe3\x26\xdd\x27\x0f\x46\x6c\x8a\x85\xab\x82\xcc\xdb\x4a\x29\x47\xb7\xa5\xb4\xa3\x00\x42\xf1\xbd"
 
 	minSleep       = 10 * time.Millisecond
-	maxSleep       = 2 * time.Second
+	maxSleep       = 24 * time.Hour
 	decayConstant  = 2
 	rootURL        = "https://pan.baidu.com"
 	uploadRootURL  = "https://d.pcs.baidu.com"

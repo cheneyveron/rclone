@@ -585,6 +585,26 @@ func TestShouldRetryHTTPStatusWithoutTransportError(t *testing.T) {
 	}
 }
 
+func TestPacerBackoffPolicy(t *testing.T) {
+	const wantMaxSleep = 24 * time.Hour
+	if maxSleep != wantMaxSleep {
+		t.Fatalf("maxSleep = %v, want %v", maxSleep, wantMaxSleep)
+	}
+
+	calculator := pacer.NewDefault(
+		pacer.MinSleep(minSleep),
+		pacer.MaxSleep(maxSleep),
+		pacer.DecayConstant(decayConstant),
+	)
+	got := calculator.Calculate(pacer.State{
+		SleepTime:          wantMaxSleep,
+		ConsecutiveRetries: 1,
+	})
+	if got != wantMaxSleep {
+		t.Fatalf("backoff after reaching cap = %v, want %v", got, wantMaxSleep)
+	}
+}
+
 func TestDownloadUserAgentMeetsBaiduRequirement(t *testing.T) {
 	if !strings.Contains(baiduUserAgent, "pan.baidu.com") {
 		t.Fatalf("download User-Agent %q does not contain pan.baidu.com", baiduUserAgent)
