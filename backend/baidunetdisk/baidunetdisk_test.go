@@ -573,35 +573,55 @@ func TestWaitForTaskChecksAPIError(t *testing.T) {
 }
 
 func TestShouldRetryHTTPStatusWithoutTransportError(t *testing.T) {
-	retry, err := shouldRetry(context.Background(), &http.Response{
-		StatusCode: http.StatusInternalServerError,
-		Status:     "500 Internal Server Error",
-	}, nil)
-	if !retry {
-		t.Fatal("shouldRetry() = false, want true")
-	}
-	if err == nil {
-		t.Fatal("shouldRetry() returned a nil error for a retryable HTTP status")
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			retry, err := shouldRetry(context.Background(), &http.Response{
+				StatusCode: status,
+				Status:     strconv.Itoa(status) + " " + http.StatusText(status),
+			}, nil)
+			if !retry {
+				t.Fatal("shouldRetry() = false, want true")
+			}
+			if err == nil {
+				t.Fatal("shouldRetry() returned a nil error for a retryable HTTP status")
+			}
+		})
 	}
 }
 
 func TestPacerBackoffPolicy(t *testing.T) {
-	const wantMaxSleep = 24 * time.Hour
-	if maxSleep != wantMaxSleep {
-		t.Fatalf("maxSleep = %v, want %v", maxSleep, wantMaxSleep)
+	calculator := baiduPacerCalculator{}
+	want := []time.Duration{
+		3 * time.Minute,
+		6 * time.Minute,
+		12 * time.Minute,
+		24 * time.Minute,
+		48 * time.Minute,
+		96 * time.Minute,
+		192 * time.Minute,
+		384 * time.Minute,
+		768 * time.Minute,
+		24 * time.Hour,
 	}
 
-	calculator := pacer.NewDefault(
-		pacer.MinSleep(minSleep),
-		pacer.MaxSleep(maxSleep),
-		pacer.DecayConstant(decayConstant),
-	)
-	got := calculator.Calculate(pacer.State{
-		SleepTime:          wantMaxSleep,
-		ConsecutiveRetries: 1,
-	})
-	if got != wantMaxSleep {
-		t.Fatalf("backoff after reaching cap = %v, want %v", got, wantMaxSleep)
+	sleepTime := minSleep
+	for retry, wantSleep := range want {
+		sleepTime = calculator.Calculate(pacer.State{
+			SleepTime:          sleepTime,
+			ConsecutiveRetries: retry + 1,
+		})
+		if sleepTime != wantSleep {
+			t.Fatalf("backoff after retry %d = %v, want %v", retry+1, sleepTime, wantSleep)
+		}
+	}
+	if got := calculator.Calculate(pacer.State{
+		SleepTime:          maxSleep,
+		ConsecutiveRetries: maxRetries + 1,
+	}); got != maxSleep {
+		t.Fatalf("backoff after reaching cap = %v, want %v", got, maxSleep)
+	}
+	if got := calculator.Calculate(pacer.State{SleepTime: maxSleep}); got != minSleep {
+		t.Fatalf("backoff after success = %v, want %v", got, minSleep)
 	}
 }
 

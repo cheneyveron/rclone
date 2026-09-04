@@ -39,8 +39,9 @@ const (
 	bdpanXOREncodedClientSecret = "\xaa\xed\x04\x6c\xd3\x98\x4d\x28\xe3\x26\xdd\x27\x0f\x46\x6c\x8a\x85\xab\x82\xcc\xdb\x4a\x29\x47\xb7\xa5\xb4\xa3\x00\x42\xf1\xbd"
 
 	minSleep       = 10 * time.Millisecond
+	initialBackoff = 3 * time.Minute
 	maxSleep       = 24 * time.Hour
-	decayConstant  = 2
+	maxRetries     = 10
 	rootURL        = "https://pan.baidu.com"
 	uploadRootURL  = "https://d.pcs.baidu.com"
 	defaultAppName = "bdpan" // App folder name in /apps/
@@ -61,12 +62,37 @@ const (
 
 // retryErrorCodes is a slice of HTTP status codes that will be retried.
 var retryErrorCodes = []int{
+	http.StatusRequestTimeout,
 	http.StatusTooManyRequests,
 	http.StatusInternalServerError,
 	http.StatusBadGateway,
 	http.StatusServiceUnavailable,
 	http.StatusGatewayTimeout,
 	509, // Bandwidth Limit Exceeded
+}
+
+type baiduPacerCalculator struct{}
+
+func (baiduPacerCalculator) Calculate(state pacer.State) time.Duration {
+	if retryAfter, ok := pacer.IsRetryAfter(state.LastError); ok {
+		return min(max(retryAfter, minSleep), maxSleep)
+	}
+	if state.ConsecutiveRetries == 0 {
+		return minSleep
+	}
+	if state.SleepTime < initialBackoff {
+		return initialBackoff
+	}
+	if state.SleepTime >= maxSleep/2 {
+		return maxSleep
+	}
+	return state.SleepTime * 2
+}
+
+func newBaiduPacer(ctx context.Context) *fs.Pacer {
+	p := fs.NewPacer(ctx, baiduPacerCalculator{})
+	p.SetRetries(maxRetries + 1)
+	return p
 }
 
 func mustXORDecode(encoded, key string) string {
@@ -562,7 +588,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt:     *opt,
 		client:  oAuthClient,
 		ts:      ts,
-		pacer:   fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		pacer:   newBaiduPacer(ctx),
 	}
 
 	f.features = (&fs.Features{
